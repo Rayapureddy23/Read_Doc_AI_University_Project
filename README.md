@@ -1,7 +1,7 @@
 # ReadDoc AI
 
 **AI-powered document question answering system**
-*MSc Data Science and Analytics — University of Hertfordshire*
+*MSc Data Science — University of Hertfordshire*
 
 ---
 
@@ -74,8 +74,8 @@ PDF / HTML upload
 ## Quick start
 
 ```bash
-git clone https://github.com/yourusername/readdoc-ai.git
-cd readdoc-ai
+git clone https://github.com/Rayapureddy23/Read_Doc_AI_University_Project.git
+cd Read_Doc_AI_University_Project
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
@@ -126,5 +126,6 @@ Test document: Kroese, D.P. et al. (2020). *Data Science and Machine Learning*. 
 ---
 
 ## Author
-
-MSc Data Science and Analytics — University of Hertfordshire
+Dharmendra kumar Reddy Rayapureddy
+rayapureddydharmendra0404@gmail.com
+MSc Data Science — University of Hertfordshire
