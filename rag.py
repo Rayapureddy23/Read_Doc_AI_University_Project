@@ -2,6 +2,7 @@
 rag.py — Retrieval-Augmented Generation Pipeline
 =================================================
 
+
 FIXED: Cache is now keyed by BOTH chunk_size AND the uploaded file(s).
 Previously the cache only checked chunk_size, so uploading a NEW file
 while keeping the same chunk size setting would incorrectly load the
@@ -25,9 +26,15 @@ OVERLAP          = 100
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-print(f"Loading embedding model: {EMBEDDING_MODEL}")
-embedding_model = SentenceTransformer(EMBEDDING_MODEL)
-print("Embedding model ready.")
+embedding_model = None
+
+def get_embedding_model():
+    global embedding_model
+    if embedding_model is None:
+        print(f"Loading embedding model: {EMBEDDING_MODEL}")
+        embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+        print("Embedding model ready.")
+    return embedding_model
 
 # ── In-memory state ───────────────────────────────────────────────────────────
 chunk_data: list = []
@@ -176,7 +183,8 @@ def build_index(file_paths: list, chunk_size: int = 600) -> dict:
     # ── Step 3: Embed all chunks ───────────────────────────────────────────
     texts = [c["text"] for c in chunk_data]
     print(f"Embedding {len(texts)} chunks [{cache_key}]...")
-    embeddings = embedding_model.encode(texts, show_progress_bar=True, batch_size=64)
+    model = get_embedding_model()
+    embeddings = model.encode(texts, show_progress_bar=True, batch_size=64)
 
     # ── Step 4: Build FAISS index ──────────────────────────────────────────
     dimension = embeddings.shape[1]
@@ -281,7 +289,8 @@ def search(question: str, top_k: int = 5) -> list:
     if index is None or len(chunk_data) == 0:
         return []
 
-    q_vector            = embedding_model.encode([question])
+    model = get_embedding_model()
+    q_vector = model.encode([question])
     distances, indices  = index.search(
         np.array(q_vector).astype("float32"), top_k
     )

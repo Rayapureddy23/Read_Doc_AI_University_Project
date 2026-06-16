@@ -1,7 +1,6 @@
 """
 1_Project_Overview.py — Research Project Overview
 ===================================================
-ReadDoc AI | MSc Data Science and Analytics
 
 Shows the supervisor:
   - Research question, aim, objectives
