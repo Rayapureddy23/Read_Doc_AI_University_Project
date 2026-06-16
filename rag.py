@@ -198,6 +198,43 @@ def build_index(file_paths: list, chunk_size: int = 600) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# BUILD ALL CHUNK SIZES AT ONCE
+# Pre-builds and caches every chunk size variant for the given file(s) in
+# one pass. After this runs, switching the chunk-size slider only needs to
+# call build_index() again — which will load instantly from cache instead
+# of re-embedding the whole document.
+# ──────────────────────────────────────────────────────────────────────────────
+def build_all_sizes(file_paths: list, chunk_sizes=(300, 600, 1000),
+                     activate: int = 600, progress_callback=None) -> dict:
+    """
+    Build (or load from cache) an index for every chunk size in chunk_sizes.
+
+    Args:
+        file_paths:        list of uploaded file paths
+        chunk_sizes:        which chunk sizes to pre-build
+        activate:           which chunk size should be the active one when done
+        progress_callback:  optional fn(step, total, chunk_size, result) for UI progress
+
+    Returns:
+        dict mapping chunk_size -> build_index() result dict
+    """
+    results = {}
+    total   = len(chunk_sizes)
+    for step, size in enumerate(chunk_sizes, start=1):
+        result = build_index(file_paths, chunk_size=size)
+        results[size] = result
+        if progress_callback:
+            progress_callback(step, total, size, result)
+
+    # Leave the global index/chunk_data pointed at the requested active size.
+    # This call is instant — that size was just built/cached above.
+    if activate in chunk_sizes:
+        build_index(file_paths, chunk_size=activate)
+
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # LOAD INDEX FROM DISK (app startup — best effort, no file context yet)
 # ──────────────────────────────────────────────────────────────────────────────
 def load_index_from_disk(chunk_size: int = 600) -> bool:

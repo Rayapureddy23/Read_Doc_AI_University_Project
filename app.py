@@ -1,9 +1,16 @@
 """
 app.py — ReadDoc AI Main Chat Interface
 ========================================
-ReadDoc AI | MSc Data Science and Analytics
 
 Main chat page. Upload documents, ask questions, get sourced answers.
+
+UPDATED BEHAVIOUR:
+  - Clicking "Build index" pre-builds ALL THREE chunk sizes (300/600/1000)
+    for the uploaded file(s) in one pass.
+  - Moving the "Chunk size" slider afterwards instantly switches the active
+    index (loaded from cache) without needing to click Build index again.
+  - Moving the "Retrieval depth (k)" slider needs no rebuild at all — it is
+    read live at query time by rag.search().
 """
 
 import streamlit as st
@@ -66,6 +73,10 @@ html,body,[class*="css"]{font-family:'DM Sans',sans-serif!important}
     background:#F8FAFF!important;border:1px solid #E5E9F5!important;
     border-radius:18px 18px 18px 4px!important;padding:14px 20px!important;
     max-width:80%!important;color:#1F2937!important}
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) p{
+    color:#1F2937!important;line-height:1.7!important;margin-bottom:6px!important}
+[data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarAssistant"]) strong{
+    color:#111827!important;font-weight:600!important}
 [data-testid="stChatMessageAvatarAssistant"]{background:#1a56db!important;border-radius:50%!important}
 [data-testid="stChatInput"]{border:1.5px solid #E5E9F5!important;
     border-radius:12px!important;background:#F8FAFF!important}
@@ -90,6 +101,8 @@ html,body,[class*="css"]{font-family:'DM Sans',sans-serif!important}
 hr{border:none!important;border-top:1px solid #F3F4F6!important;margin:1rem 0!important}
 ::-webkit-scrollbar{width:5px}
 ::-webkit-scrollbar-thumb{background:#E5E9F5;border-radius:10px}
+.ready-banner{background:#ECFDF5;border:1px solid #A7F3D0;border-radius:8px;
+    padding:8px 12px;font-size:12px;color:#059669;margin-top:6px}
 </style>
 """, unsafe_allow_html=True)
 
@@ -103,10 +116,36 @@ SVG = '''<svg width="22" height="22" viewBox="0 0 24 24" fill="none"
 
 # ── Setup ──────────────────────────────────────────────────────────────────────
 db.init_db()
+
+if "chunk_size" not in st.session_state:
+    st.session_state.chunk_size = 600
+if "top_k" not in st.session_state:
+    st.session_state.top_k = 5
+if "indexed_file_paths" not in st.session_state:
+    st.session_state.indexed_file_paths = None
+if "prebuilt_sizes" not in st.session_state:
+    st.session_state.prebuilt_sizes = set()   # which chunk sizes are confirmed ready
+if "active_chunk_size" not in st.session_state:
+    st.session_state.active_chunk_size = None
+
 if "index_loaded" not in st.session_state:
     st.session_state.index_loaded = rag.load_index_from_disk(
-        chunk_size=st.session_state.get("chunk_size", 600)
+        chunk_size=st.session_state.chunk_size
     )
+
+# ── Auto-switch active index when the chunk-size slider changes ───────────────
+# If the document has already been indexed (Build index was clicked at least
+# once), and the slider's chunk_size no longer matches the active index,
+# instantly switch to that size. This is fast because build_index() loads
+# from the per-size cache rather than re-embedding the document.
+if (st.session_state.indexed_file_paths
+        and st.session_state.chunk_size in st.session_state.prebuilt_sizes
+        and st.session_state.active_chunk_size != st.session_state.chunk_size):
+    rag.build_index(
+        st.session_state.indexed_file_paths,
+        chunk_size=st.session_state.chunk_size,
+    )
+    st.session_state.active_chunk_size = st.session_state.chunk_size
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -145,38 +184,52 @@ with st.sidebar:
 
     st.divider()
 
-    # Experiment settings
+    # ── Experiment settings ─────────────────────────────────────────────────
     st.markdown('<div class="sidebar-label">Experiment settings</div>', unsafe_allow_html=True)
+
     chunk_size = st.select_slider(
         "Chunk size (chars)",
         options=[300, 600, 1000],
-        value=st.session_state.get("chunk_size", 600),
+        key="chunk_size",
+        help="Switches instantly once all three sizes have been built below.",
     )
-    st.session_state.chunk_size = chunk_size
 
     top_k = st.select_slider(
         "Retrieval depth (k)",
         options=[3, 5, 10],
-        value=st.session_state.get("top_k", 5),
+        key="top_k",
+        help="Applies live to your next question — no rebuild needed.",
     )
-    st.session_state.top_k = top_k
 
+    is_ready = chunk_size in st.session_state.prebuilt_sizes
     st.markdown(
         f'<div class="idx-status" style="margin-top:2px">'
         f'Chunk: <b>{chunk_size}</b> chars &nbsp;·&nbsp; k: <b>{top_k}</b></div>',
         unsafe_allow_html=True,
     )
+    if st.session_state.indexed_file_paths:
+        if is_ready:
+            st.markdown(
+                '<div class="ready-banner">✓ This chunk size is pre-built — active now</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div class="idx-status" style="color:#C2410C">'
+                'Not built yet for this size — click Build index below</div>',
+                unsafe_allow_html=True,
+            )
 
     st.divider()
 
-    # Upload
+    # ── Upload ───────────────────────────────────────────────────────────────
     st.markdown('<div class="sidebar-label">Upload documents</div>', unsafe_allow_html=True)
     uploaded_files = st.file_uploader(
         "PDF or HTML", type=["pdf", "html", "htm"],
         accept_multiple_files=True, label_visibility="collapsed",
     )
 
-    if st.button("Build index", use_container_width=True, type="primary"):
+    if st.button("Build index — all chunk sizes", use_container_width=True, type="primary"):
         if not uploaded_files:
             st.warning("Upload at least one file first.")
         else:
@@ -187,20 +240,43 @@ with st.sidebar:
                 with open(path, "wb") as out:
                     out.write(f.getbuffer())
                 saved_paths.append(path)
-            with st.spinner(f"Building index — chunk {chunk_size} chars..."):
-                result = rag.build_index(saved_paths, chunk_size=chunk_size)
-            st.session_state.index_loaded = True
-            if result.get("cached"):
-                st.success(f"Loaded from cache — {result['total_chunks']} chunks")
-            else:
-                st.success(f"Built — {result['total_chunks']} chunks · {result['total_files']} file(s)")
+
+            progress = st.progress(0, text="Starting...")
+
+            def on_progress(step, total, size, result):
+                pct   = step / total
+                label = "cached" if result.get("cached") else "built"
+                progress.progress(
+                    pct,
+                    text=f"Chunk {size} chars — {label} "
+                         f"({result.get('total_chunks', 0)} chunks) · {step}/{total}",
+                )
+
+            results = rag.build_all_sizes(
+                saved_paths,
+                chunk_sizes=(300, 600, 1000),
+                activate=st.session_state.chunk_size,
+                progress_callback=on_progress,
+            )
+            progress.empty()
+
+            st.session_state.indexed_file_paths = saved_paths
+            st.session_state.prebuilt_sizes      = set(results.keys())
+            st.session_state.active_chunk_size   = st.session_state.chunk_size
+            st.session_state.index_loaded        = True
+
+            summary = " · ".join(
+                f"{size}: {r['total_chunks']} chunks" for size, r in results.items()
+            )
+            st.success(f"All sizes ready — {summary}")
             st.session_state.close_sidebar = True
 
     status = rag.get_status()
     if status["loaded"]:
         st.markdown(
             f'<div class="idx-status"><span class="sdot"></span>'
-            f'{status["total_chunks"]} chunks · {len(status["files"])} file(s)</div>',
+            f'{status["total_chunks"]} chunks · {len(status["files"])} file(s) '
+            f'· active size: {st.session_state.active_chunk_size}</div>',
             unsafe_allow_html=True,
         )
     else:
