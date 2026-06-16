@@ -1,22 +1,17 @@
 """
 rag.py — Retrieval-Augmented Generation Pipeline
 =================================================
-ReadDoc AI | MSc Data Science and Analytics
 
-This module handles the complete document processing pipeline:
-  1. Document ingestion  — PDF and HTML text extraction
-  2. Text chunking       — splitting text into overlapping segments
-  3. Embedding           — converting text to semantic vectors
-  4. FAISS indexing      — storing and searching vectors
-  5. Retrieval           — finding relevant chunks for a query
-
-Research variable: chunk_size (300 / 600 / 1000 chars)
-Each chunk size is cached separately so switching is instant
-after the first build.
+FIXED: Cache is now keyed by BOTH chunk_size AND the uploaded file(s).
+Previously the cache only checked chunk_size, so uploading a NEW file
+while keeping the same chunk size setting would incorrectly load the
+OLD file's cached index. Now a hash of the file names + sizes is
+included in the cache key, so a new upload always rebuilds correctly.
 """
 
 import os
 import pickle
+import hashlib
 import numpy as np
 import faiss
 from pypdf import PdfReader
@@ -24,13 +19,12 @@ from bs4 import BeautifulSoup
 from sentence_transformers import SentenceTransformer
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-DATA_DIR       = "data"
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"   # 384-dimensional sentence embeddings
-OVERLAP         = 100                   # character overlap between chunks
+DATA_DIR        = "data"
+EMBEDDING_MODEL  = "all-MiniLM-L6-v2"
+OVERLAP          = 100
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# ── Load embedding model once at startup ──────────────────────────────────────
 print(f"Loading embedding model: {EMBEDDING_MODEL}")
 embedding_model = SentenceTransformer(EMBEDDING_MODEL)
 print("Embedding model ready.")
@@ -38,22 +32,37 @@ print("Embedding model ready.")
 # ── In-memory state ───────────────────────────────────────────────────────────
 chunk_data: list = []
 index            = None
+current_cache_key = None   # tracks which file+chunk_size is currently loaded
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CACHE KEY — based on file names + file sizes + chunk size
+# This ensures a NEW upload always produces a NEW cache key,
+# so the old cached index is never mistakenly reused.
+# ──────────────────────────────────────────────────────────────────────────────
+def make_cache_key(file_paths: list, chunk_size: int) -> str:
+    """
+    Build a unique cache key from the file names, their byte sizes,
+    and the chunk size. Same files + same chunk size → same key
+    (instant cache load). Different files → different key (rebuild).
+    """
+    parts = []
+    for path in sorted(file_paths):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            size = 0
+        parts.append(f"{os.path.basename(path)}:{size}")
+
+    signature = "|".join(parts) + f"|chunk{chunk_size}"
+    digest    = hashlib.md5(signature.encode("utf-8")).hexdigest()[:10]
+    return f"{chunk_size}_{digest}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TEXT CHUNKING
-# Split a long text into overlapping character-based segments.
-# Overlap ensures sentences are not cut mid-sentence between chunks.
 # ──────────────────────────────────────────────────────────────────────────────
 def split_text(text: str, chunk_size: int = 600, overlap: int = OVERLAP) -> list:
-    """
-    Split text into overlapping chunks of chunk_size characters.
-
-    Example (chunk_size=10, overlap=3):
-      Text : "ABCDEFGHIJKLMNOP"
-      Chunk1: ABCDEFGHIJ  (0 → 10)
-      Chunk2: HIJKLMNOPQ  (7 → 17)   ← overlaps by 3 chars
-    """
     chunks = []
     start  = 0
     while start < len(text):
@@ -67,7 +76,6 @@ def split_text(text: str, chunk_size: int = 600, overlap: int = OVERLAP) -> list
 # DOCUMENT INGESTION — PDF
 # ──────────────────────────────────────────────────────────────────────────────
 def load_pdf(file_path: str) -> list:
-    """Extract text from every page of a PDF file."""
     documents = []
     try:
         reader = PdfReader(file_path)
@@ -89,7 +97,6 @@ def load_pdf(file_path: str) -> list:
 # DOCUMENT INGESTION — HTML
 # ──────────────────────────────────────────────────────────────────────────────
 def load_html(file_path: str) -> list:
-    """Extract visible text from an HTML file using BeautifulSoup."""
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
             soup = BeautifulSoup(f.read(), "html.parser")
@@ -109,28 +116,31 @@ def load_html(file_path: str) -> list:
 
 # ──────────────────────────────────────────────────────────────────────────────
 # BUILD INDEX
-# Main function — ingest → chunk → embed → FAISS index → save to disk
-# Each chunk_size gets its own cached index file.
+# Cache key now includes file identity, not just chunk_size.
 # ──────────────────────────────────────────────────────────────────────────────
 def build_index(file_paths: list, chunk_size: int = 600) -> dict:
     """
-    Build or load a FAISS index for the given chunk size.
+    Build or load a FAISS index for the given files + chunk size.
 
-    Returns:
-        dict with total_files, total_chunks, cached (bool)
+    The cache key is derived from the file names, file sizes, and
+    chunk size together. This guarantees that uploading a different
+    document always triggers a fresh build, even if the chunk size
+    setting is unchanged from a previous session.
     """
-    global chunk_data, index
+    global chunk_data, index, current_cache_key
 
-    index_path  = os.path.join(DATA_DIR, f"faiss_{chunk_size}.index")
-    chunks_path = os.path.join(DATA_DIR, f"chunks_{chunk_size}.pkl")
+    cache_key   = make_cache_key(file_paths, chunk_size)
+    index_path  = os.path.join(DATA_DIR, f"faiss_{cache_key}.index")
+    chunks_path = os.path.join(DATA_DIR, f"chunks_{cache_key}.pkl")
 
-    # ── Return cached index instantly if available ─────────────────────────
+    # ── Return cached index instantly if it matches THIS file + chunk size ──
     if os.path.exists(index_path) and os.path.exists(chunks_path):
         try:
             index = faiss.read_index(index_path)
             with open(chunks_path, "rb") as f:
                 chunk_data = pickle.load(f)
-            print(f"Loaded cached index (chunk {chunk_size}): {len(chunk_data)} chunks")
+            current_cache_key = cache_key
+            print(f"Loaded cached index [{cache_key}]: {len(chunk_data)} chunks")
             return {
                 "total_files":  len({c["file_name"] for c in chunk_data}),
                 "total_chunks": len(chunk_data),
@@ -165,20 +175,21 @@ def build_index(file_paths: list, chunk_size: int = 600) -> dict:
 
     # ── Step 3: Embed all chunks ───────────────────────────────────────────
     texts = [c["text"] for c in chunk_data]
-    print(f"Embedding {len(texts)} chunks (chunk size = {chunk_size})...")
+    print(f"Embedding {len(texts)} chunks [{cache_key}]...")
     embeddings = embedding_model.encode(texts, show_progress_bar=True, batch_size=64)
 
     # ── Step 4: Build FAISS index ──────────────────────────────────────────
-    dimension = embeddings.shape[1]           # 384 for all-MiniLM-L6-v2
-    index     = faiss.IndexFlatL2(dimension)  # exact L2 distance search
+    dimension = embeddings.shape[1]
+    index     = faiss.IndexFlatL2(dimension)
     index.add(np.array(embeddings).astype("float32"))
 
-    # ── Step 5: Save to disk ───────────────────────────────────────────────
+    # ── Step 5: Save to disk under the file-aware cache key ────────────────
     faiss.write_index(index, index_path)
     with open(chunks_path, "wb") as f:
         pickle.dump(chunk_data, f)
 
-    print(f"Index built and saved: {len(chunk_data)} chunks")
+    current_cache_key = cache_key
+    print(f"Index built and saved [{cache_key}]: {len(chunk_data)} chunks")
     return {
         "total_files":  len(file_paths),
         "total_chunks": len(chunk_data),
@@ -187,18 +198,39 @@ def build_index(file_paths: list, chunk_size: int = 600) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# LOAD INDEX FROM DISK (called at app startup)
+# LOAD INDEX FROM DISK (app startup — best effort, no file context yet)
 # ──────────────────────────────────────────────────────────────────────────────
 def load_index_from_disk(chunk_size: int = 600) -> bool:
-    global chunk_data, index
-    index_path  = os.path.join(DATA_DIR, f"faiss_{chunk_size}.index")
-    chunks_path = os.path.join(DATA_DIR, f"chunks_{chunk_size}.pkl")
-    if os.path.exists(index_path) and os.path.exists(chunks_path):
+    """
+    At app startup we don't yet know which file was uploaded, so this
+    only looks for ANY previously-built index matching the chunk size
+    prefix. Once the user uploads a file and clicks Build index,
+    build_index() takes over with the correct file-aware cache key.
+    """
+    global chunk_data, index, current_cache_key
+    prefix = f"faiss_{chunk_size}_"
+    if not os.path.isdir(DATA_DIR):
+        return False
+
+    matches = [f for f in os.listdir(DATA_DIR)
+               if f.startswith(prefix) and f.endswith(".index")]
+    if not matches:
+        return False
+
+    # Load the most recently modified matching index
+    matches.sort(key=lambda f: os.path.getmtime(os.path.join(DATA_DIR, f)), reverse=True)
+    chosen      = matches[0]
+    cache_key   = chosen[len("faiss_"):-len(".index")]
+    index_path  = os.path.join(DATA_DIR, chosen)
+    chunks_path = os.path.join(DATA_DIR, f"chunks_{cache_key}.pkl")
+
+    if os.path.exists(chunks_path):
         try:
             index = faiss.read_index(index_path)
             with open(chunks_path, "rb") as f:
                 chunk_data = pickle.load(f)
-            print(f"Loaded index (chunk {chunk_size}): {len(chunk_data)} chunks.")
+            current_cache_key = cache_key
+            print(f"Loaded most recent index [{cache_key}]: {len(chunk_data)} chunks.")
             return True
         except Exception as e:
             print(f"Could not load index: {e}")
@@ -206,28 +238,21 @@ def load_index_from_disk(chunk_size: int = 600) -> bool:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# SEARCH — retrieve top-k most relevant chunks for a question
-# Research variable: top_k (3 / 5 / 10)
+# SEARCH
 # ──────────────────────────────────────────────────────────────────────────────
 def search(question: str, top_k: int = 5) -> list:
-    """
-    Encode the question, search FAISS for the top_k nearest chunks.
-    Returns list of chunk dicts with distance field added.
-    Lower distance = more semantically similar.
-    FAISS returns -1 for missing results — these are filtered out.
-    """
     if index is None or len(chunk_data) == 0:
         return []
 
-    q_vector   = embedding_model.encode([question])
-    distances, indices = index.search(
+    q_vector            = embedding_model.encode([question])
+    distances, indices  = index.search(
         np.array(q_vector).astype("float32"), top_k
     )
 
     results = []
     seen    = set()
     for dist, i in zip(distances[0], indices[0]):
-        if i < 0 or i >= len(chunk_data):   # FAISS returns -1 for no match
+        if i < 0 or i >= len(chunk_data):
             continue
         item = chunk_data[i]
         key  = (item["file_name"], item["page_number"])
@@ -239,11 +264,34 @@ def search(question: str, top_k: int = 5) -> list:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# STATUS — for the UI
+# STATUS
 # ──────────────────────────────────────────────────────────────────────────────
 def get_status() -> dict:
     return {
         "loaded":       index is not None,
         "total_chunks": len(chunk_data),
         "files":        list({c["file_name"] for c in chunk_data}),
+        "cache_key":    current_cache_key,
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLEAR CACHE — utility to wipe all old cached indexes
+# Useful if old caches from previous documents are cluttering data/
+# ──────────────────────────────────────────────────────────────────────────────
+def clear_all_cached_indexes():
+    """Delete every cached .index and .pkl file in data/. Use with caution."""
+    global chunk_data, index, current_cache_key
+    removed = 0
+    if os.path.isdir(DATA_DIR):
+        for fname in os.listdir(DATA_DIR):
+            if fname.startswith("faiss_") or fname.startswith("chunks_"):
+                try:
+                    os.remove(os.path.join(DATA_DIR, fname))
+                    removed += 1
+                except OSError:
+                    pass
+    chunk_data         = []
+    index              = None
+    current_cache_key  = None
+    return removed
