@@ -79,7 +79,7 @@ cd Read_Doc_AI_University_Project
 python -m venv venv
 venv\Scripts\activate
 pip install -r requirements.txt
-# Edit .streamlit/secrets.toml → add your GROQ_API_KEY
+# Edit .streamlit/secrets.toml
 streamlit run app.py
 ```
 
