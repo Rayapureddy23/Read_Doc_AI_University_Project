@@ -18,3 +18,5 @@ data/faiss_*.index
 data/chunks_*.pkl
 data/uploads/
 check_rag.py
+
+error_log.txt
