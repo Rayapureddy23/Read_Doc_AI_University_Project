@@ -11,31 +11,32 @@ included in the cache key, so a new upload always rebuilds correctly.
 """
 
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import pickle
 import hashlib
 import numpy as np
 import faiss
 from pypdf import PdfReader
 from bs4 import BeautifulSoup
-from sentence_transformers import SentenceTransformer
 
-# ── Constants ──────────────────────────────────────────────────────────────────
 DATA_DIR        = "data"
-EMBEDDING_MODEL  = "all-MiniLM-L6-v2"
-OVERLAP          = 100
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+OVERLAP         = 100
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-embedding_model = None
+# Lazy loading with Streamlit cache — loads once, stays in memory
+# Prevents app from crashing due to memory limits on Streamlit Cloud
+import streamlit as st
 
+@st.cache_resource
 def get_embedding_model():
-    global embedding_model
-    if embedding_model is None:
-        print(f"Loading embedding model: {EMBEDDING_MODEL}")
-        embedding_model = SentenceTransformer(EMBEDDING_MODEL)
-        print("Embedding model ready.")
-    return embedding_model
-
+    from sentence_transformers import SentenceTransformer
+    print(f"Loading embedding model: {EMBEDDING_MODEL}")
+    model = SentenceTransformer(EMBEDDING_MODEL)
+    print("Embedding model ready.")
+    return model
 # ── In-memory state ───────────────────────────────────────────────────────────
 chunk_data: list = []
 index            = None
