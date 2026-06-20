@@ -1,7 +1,6 @@
 """
 2_How_It_Works.py — Pipeline Explained Step by Step
 =====================================================
-ReadDoc AI | MSc Data Science and Analytics
 
 Shows the supervisor exactly how the code works:
   - Each pipeline stage with code snippets
