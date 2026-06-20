@@ -1,6 +1,7 @@
 """
 8_RAGAS_Evaluation.py — Automated RAG Evaluation using RAGAS
 ==============================================================
+
 Runs RAGAS scoring for a chosen experiment configuration (E1-E9), saves
 the result to the shared experiments database, displays a terminal-style
 score panel for the latest run, and plots comparison charts across every
@@ -84,12 +85,47 @@ if not RAGAS_AVAILABLE:
 
 # ── RAGAS judge setup — uses Groq (already in this project) instead of
 # OpenAI, which RAGAS defaults to and which this project has no key for.
+#
+# NOTE: we deliberately do NOT use the langchain_groq package here.
+# ragas==0.1.21 requires langchain-core<0.3, but every published version
+# of langchain_groq (even the very first, 0.2.0) requires langchain-core
+# >=0.3 — there is no version of langchain_groq that can ever satisfy
+# both constraints at once, so pip's resolver always fails. Instead we
+# talk to Groq directly with the `groq` SDK (already a dependency) and
+# wrap it in a small custom class implementing LangChain's plain LLM
+# interface, which ragas's LangchainLLMWrapper accepts natively.
 GROQ_JUDGE_AVAILABLE = True
 groq_judge_error = None
 try:
     from ragas.llms import LangchainLLMWrapper
     from ragas.embeddings import LangchainEmbeddingsWrapper
-    from langchain_groq import ChatGroq
+    from langchain_core.language_models.llms import LLM
+    from groq import Groq as GroqClient
+    from typing import Optional, List, Any
+
+    @st.cache_resource
+    def _get_groq_client():
+        groq_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
+        return GroqClient(api_key=groq_key)
+
+    class _GroqLLM(LLM):
+        """Minimal LangChain-compatible LLM wrapper around the Groq SDK,
+        used as the RAGAS judge in place of langchain_groq."""
+        model: str = "llama-3.3-70b-versatile"
+        temperature: float = 0.0
+
+        @property
+        def _llm_type(self) -> str:
+            return "groq-custom"
+
+        def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> str:
+            client   = _get_groq_client()
+            response = client.chat.completions.create(
+                model=self.model,
+                temperature=self.temperature,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return response.choices[0].message.content
 
     class _LocalEmbeddings:
         """Minimal LangChain-compatible embeddings wrapper around the
@@ -101,10 +137,7 @@ try:
             return rag.get_embedding_model().encode([text])[0].tolist()
 
     def get_ragas_judge():
-        groq_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
-        judge_llm = LangchainLLMWrapper(
-            ChatGroq(model="llama-3.3-70b-versatile", api_key=groq_key, temperature=0)
-        )
+        judge_llm        = LangchainLLMWrapper(_GroqLLM())
         judge_embeddings = LangchainEmbeddingsWrapper(_LocalEmbeddings())
         return judge_llm, judge_embeddings
 
@@ -313,9 +346,9 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
 
     if not GROQ_JUDGE_AVAILABLE:
         st.warning(
-            "langchain_groq is not installed, so RAGAS will fall back to its "
-            "OpenAI default judge and fail without an OpenAI key. "
-            "Run: pip install langchain_groq"
+            f"Groq judge setup failed ({groq_judge_error}), so RAGAS will "
+            "fall back to its OpenAI default judge and fail without an "
+            "OpenAI key."
         )
 
     try:
@@ -362,8 +395,8 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
         if "openai" in str(e).lower() or "api_key" in str(e).lower():
             st.info(
                 "This looks like RAGAS tried to use OpenAI instead of Groq. "
-                "Make sure langchain_groq is installed and your GROQ_API_KEY "
-                "is set in .streamlit/secrets.toml."
+                "Check that your GROQ_API_KEY is set in "
+                ".streamlit/secrets.toml — that is the only key this judge needs."
             )
 
 # ── Section 3: latest run — terminal panel ─────────────────────────────────────
@@ -503,16 +536,19 @@ if GROQ_JUDGE_AVAILABLE:
     <div class="info-box">
         This page scores answers using <b>Llama 3.3 (via Groq)</b> as the RAGAS
         judge, and the same local <b>all-MiniLM-L6-v2</b> embedding model used
-        for retrieval — no OpenAI key required. This is wired in automatically
-        for every run above.
+        for retrieval — no OpenAI key required. Groq is called directly through
+        a small custom LangChain-compatible wrapper rather than the
+        <code>langchain_groq</code> package, which cannot be installed
+        alongside <code>ragas==0.1.21</code> due to a version conflict. This is
+        wired in automatically for every run above.
     </div>
     """, unsafe_allow_html=True)
 else:
     st.markdown(f"""
     <div class="info-box" style="background:#FFF7ED;border-color:#FED7AA;color:#92400E">
-        <b>langchain_groq is not installed</b> ({groq_judge_error}), so RAGAS
-        will fall back to its OpenAI default and fail without an OpenAI key.
-        Install it to use Groq as the judge instead:
+        <b>Could not set up the Groq judge</b> ({groq_judge_error}).
+        RAGAS will fall back to its OpenAI default and fail without an
+        OpenAI key. This usually means <code>langchain-core</code> or
+        <code>groq</code> failed to install — check your requirements.txt.
     </div>
     """, unsafe_allow_html=True)
-    st.code("pip install langchain_groq", language="bash")
