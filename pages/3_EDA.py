@@ -1,13 +1,13 @@
 """
 3_EDA.py — Exploratory Data Analysis
 ======================================
-
 """
 
 import streamlit as st
 import sys, os, pickle, re
 import pandas as pd
 from collections import Counter
+from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -64,13 +64,33 @@ def find_chunk_files():
     return [f for f in os.listdir(DATA_DIR)
             if f.startswith("chunks_") and f.endswith(".pkl")]
 
-def load_chunks_by_label(filename):
+@st.cache_data
+def load_chunks_by_label(filename, _mtime):
+    """_mtime is included only so the cache busts if the file is rebuilt."""
     path = os.path.join(DATA_DIR, filename)
     try:
         with open(path, "rb") as f:
             return pickle.load(f)
     except Exception:
         return None
+
+def build_readable_label(filename):
+    """
+    Cache files are named chunks_{chunk_size}_{hash}.pkl — not readable
+    on their own. This builds a label like:
+    "600 chars · DSML.pdf · 2,377 chunks · Jun 19, 21:45"
+    """
+    cache_key  = filename.replace("chunks_", "").replace(".pkl", "")
+    chunk_size = cache_key.split("_", 1)[0]
+    mtime      = os.path.getmtime(os.path.join(DATA_DIR, filename))
+    mtime_str  = datetime.fromtimestamp(mtime).strftime("%b %d, %H:%M")
+
+    data = load_chunks_by_label(filename, mtime)
+    if not data:
+        return f"{chunk_size} chars · (could not load)"
+
+    doc_name = data[0].get("file_name", "unknown file")
+    return f"{chunk_size} chars · {doc_name} · {len(data):,} chunks · {mtime_str}"
 
 chunk_files = find_chunk_files()
 
@@ -90,11 +110,12 @@ chunk_files_sorted = sorted(
     key=lambda f: os.path.getmtime(os.path.join(DATA_DIR, f)),
     reverse=True
 )
-labels = [f.replace("chunks_", "").replace(".pkl", "") for f in chunk_files_sorted]
+labels = [build_readable_label(f) for f in chunk_files_sorted]
 
-sel_label = st.selectbox("Select an indexed document to analyse", labels, index=0)
-sel_file  = chunk_files_sorted[labels.index(sel_label)]
-chunk_data = load_chunks_by_label(sel_file)
+sel_label  = st.selectbox("Select an indexed document to analyse", labels, index=0)
+sel_file   = chunk_files_sorted[labels.index(sel_label)]
+sel_mtime  = os.path.getmtime(os.path.join(DATA_DIR, sel_file))
+chunk_data = load_chunks_by_label(sel_file, sel_mtime)
 
 if not chunk_data:
     st.warning("Could not load this index. Try rebuilding it on the main page.")
@@ -215,11 +236,14 @@ if not page_df.empty:
 st.markdown('<div class="sec">6. Chunk size comparison — all indexed configurations</div>', unsafe_allow_html=True)
 comp = []
 for fname in chunk_files_sorted:
-    cd = load_chunks_by_label(fname)
+    fmtime = os.path.getmtime(os.path.join(DATA_DIR, fname))
+    cd = load_chunks_by_label(fname, fmtime)
     if cd:
-        label_size = fname.replace("chunks_", "").replace(".pkl", "")
+        cache_key  = fname.replace("chunks_", "").replace(".pkl", "")
+        chunk_size_label = cache_key.split("_", 1)[0]
+        doc_name   = cd[0].get("file_name", "unknown")
         comp.append({
-            "Configuration":   label_size,
+            "Configuration":   f"{chunk_size_label} chars ({doc_name})",
             "Total chunks":    len(cd),
             "Avg words/chunk": round(sum(len(c["text"].split()) for c in cd)/len(cd),1),
             "Avg chars/chunk": round(sum(len(c["text"]) for c in cd)/len(cd),1),

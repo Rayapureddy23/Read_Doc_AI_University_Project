@@ -2,41 +2,49 @@
 rag.py — Retrieval-Augmented Generation Pipeline
 =================================================
 
-
 FIXED: Cache is now keyed by BOTH chunk_size AND the uploaded file(s).
 Previously the cache only checked chunk_size, so uploading a NEW file
 while keeping the same chunk size setting would incorrectly load the
 OLD file's cached index. Now a hash of the file names + sizes is
 included in the cache key, so a new upload always rebuilds correctly.
+
+FIXED: Embedding model is now lazy-loaded and cached via
+st.cache_resource instead of loading eagerly at import time. Eager
+loading reloaded the ~90MB model on every Streamlit rerun, which
+exceeded the 1GB RAM limit on Streamlit Cloud's free tier and crashed
+the app. Lazy + cached loading means the model loads once and is
+reused across reruns, page navigations, and even by the RAGAS judge.
 """
 
 import os
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"  # fixes Windows torch/faiss OpenMP DLL conflict
 
 import pickle
 import hashlib
 import numpy as np
 import faiss
+import streamlit as st
 from pypdf import PdfReader
 from bs4 import BeautifulSoup
+from sentence_transformers import SentenceTransformer
 
+# ── Constants ──────────────────────────────────────────────────────────────────
 DATA_DIR        = "data"
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-OVERLAP         = 100
+EMBEDDING_MODEL  = "all-MiniLM-L6-v2"
+OVERLAP          = 100
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
-# Lazy loading with Streamlit cache — loads once, stays in memory
-# Prevents app from crashing due to memory limits on Streamlit Cloud
-import streamlit as st
 
 @st.cache_resource
 def get_embedding_model():
-    from sentence_transformers import SentenceTransformer
+    """Load once, cache forever across all reruns and users (and pages)."""
     print(f"Loading embedding model: {EMBEDDING_MODEL}")
     model = SentenceTransformer(EMBEDDING_MODEL)
     print("Embedding model ready.")
     return model
+
+
 # ── In-memory state ───────────────────────────────────────────────────────────
 chunk_data: list = []
 index            = None
@@ -52,7 +60,7 @@ def make_cache_key(file_paths: list, chunk_size: int) -> str:
     """
     Build a unique cache key from the file names, their byte sizes,
     and the chunk size. Same files + same chunk size → same key
-    (instant cache load). Different files → different key (rebuild).
+    (instant cache load). Different files :different key (rebuild).
     """
     parts = []
     for path in sorted(file_paths):
@@ -184,8 +192,7 @@ def build_index(file_paths: list, chunk_size: int = 600) -> dict:
     # ── Step 3: Embed all chunks ───────────────────────────────────────────
     texts = [c["text"] for c in chunk_data]
     print(f"Embedding {len(texts)} chunks [{cache_key}]...")
-    model = get_embedding_model()
-    embeddings = model.encode(texts, show_progress_bar=True, batch_size=64)
+    embeddings = get_embedding_model().encode(texts, show_progress_bar=True, batch_size=64)
 
     # ── Step 4: Build FAISS index ──────────────────────────────────────────
     dimension = embeddings.shape[1]
@@ -290,8 +297,7 @@ def search(question: str, top_k: int = 5) -> list:
     if index is None or len(chunk_data) == 0:
         return []
 
-    model = get_embedding_model()
-    q_vector = model.encode([question])
+    q_vector            = get_embedding_model().encode([question])
     distances, indices  = index.search(
         np.array(q_vector).astype("float32"), top_k
     )
