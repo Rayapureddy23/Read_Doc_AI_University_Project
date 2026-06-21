@@ -1,5 +1,6 @@
 """
 8_RAGAS_Evaluation.py — Automated RAG Evaluation using RAGAS
+==============================================================
 
 
 Runs RAGAS scoring for a chosen experiment configuration (E1-E9), saves
@@ -113,16 +114,18 @@ try:
         """Minimal LangChain-compatible LLM wrapper around the Groq SDK,
         used as the RAGAS judge in place of langchain_groq.
 
-        RAGAS fires many calls per question (claim extraction, claim
-        verification, reverse-question generation, per-chunk relevance
-        judging) — easily 15-20+ calls per question. On a free-tier Groq
-        key this can exceed the requests-per-minute limit, and RAGAS
-        silently records any failed call as NaN rather than raising —
-        which is why a "successful" run can come back with every score
-        as NaN. Retrying with backoff here absorbs those transient
-        rate-limit failures instead of letting them turn into NaN.
+        Deliberately uses llama-3.1-8b-instant rather than the main
+        chat model (llama-3.3-70b-versatile). Groq tracks daily token
+        quotas separately per model, and the 8B model's quota is far
+        larger than the 70B model's — so judging draws from its own
+        untouched budget instead of competing with the actual chat
+        answers, baseline tests, and experiment runs that already use
+        llama-3.3-70b-versatile elsewhere in this app. RAGAS's judge
+        tasks (yes/no claim verification, short paraphrase generation,
+        1-5 relevance ratings) don't need 70B-class reasoning, so this
+        doesn't cost meaningful judging accuracy.
         """
-        model: str = "llama-3.3-70b-versatile"
+        model: str = "llama-3.1-8b-instant"
         temperature: float = 0.0
 
         @property
@@ -386,19 +389,50 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
     prog = st.progress(0, text="Generating answers...")
     data = {"question": [], "answer": [], "contexts": [], "ground_truth": []}
 
-    for i, question in enumerate(questions_to_run):
-        prog.progress(
-            (i + 1) / len(questions_to_run),
-            text=f"Question {i+1}/{len(questions_to_run)}: {question[:50]}..."
-        )
-        chunks   = rag.search(question, top_k=top_k)
-        answer   = ask_llama(question, chunks, [])
-        contexts = [c["text"] for c in chunks] if chunks else ["No relevant context found."]
+    try:
+        for i, question in enumerate(questions_to_run):
+            prog.progress(
+                (i + 1) / len(questions_to_run),
+                text=f"Question {i+1}/{len(questions_to_run)}: {question[:50]}..."
+            )
+            chunks   = rag.search(question, top_k=top_k)
+            answer   = ask_llama(question, chunks, [])
+            contexts = [c["text"] for c in chunks] if chunks else ["No relevant context found."]
 
-        data["question"].append(question)
-        data["answer"].append(answer)
-        data["contexts"].append(contexts)
-        data["ground_truth"].append("")
+            data["question"].append(question)
+            data["answer"].append(answer)
+            data["contexts"].append(contexts)
+            data["ground_truth"].append("")
+    except Exception as e:
+        prog.empty()
+        err_str = str(e)
+        if "rate_limit" in err_str.lower() or "429" in err_str or "tokens per day" in err_str.lower():
+            st.error(
+                f"Generated {len(data['question'])}/{len(questions_to_run)} answers, "
+                "then hit Groq's daily token quota — this is a free-tier usage "
+                "limit, not a bug in the app."
+            )
+            st.markdown("""
+            <div class="info-box">
+                RAGAS evaluation is token-heavy: every question needs one full
+                answer generation call, <i>plus</i> many extra judge calls per
+                question (claim extraction, claim verification, reverse-question
+                generation, per-chunk relevance checks). Combined with earlier
+                testing today, that adds up fast on a free-tier daily limit.
+                <br><br>
+                <b>Options:</b> wait — Groq's daily limit is a rolling 24h
+                window, so quota frees up gradually rather than all at once
+                tomorrow; try evaluating fewer questions at a time (5 instead
+                of 20) to spread token use across more days; or upgrade to
+                Groq's Dev Tier for a higher daily limit at
+                console.groq.com/settings/billing.
+            </div>
+            """, unsafe_allow_html=True)
+            with st.expander("Technical details"):
+                st.code(err_str)
+        else:
+            st.error(f"Answer generation failed: {err_str}")
+        st.stop()
 
     prog.empty()
     st.success("Answers generated. Running RAGAS scoring — this can take a few "
@@ -488,12 +522,20 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
         st.rerun()
 
     except Exception as e:
-        st.error(f"RAGAS scoring failed: {str(e)}")
-        if "openai" in str(e).lower() or "api_key" in str(e).lower():
+        err_str = str(e)
+        st.error(f"RAGAS scoring failed: {err_str}")
+        if "openai" in err_str.lower() or "api_key" in err_str.lower():
             st.info(
                 "This looks like RAGAS tried to use OpenAI instead of Groq. "
                 "Check that your GROQ_API_KEY is set in "
                 ".streamlit/secrets.toml — that is the only key this judge needs."
+            )
+        elif "rate_limit" in err_str.lower() or "429" in err_str or "tokens per day" in err_str.lower():
+            st.info(
+                "This is Groq's daily token quota being exhausted mid-run — "
+                "RAGAS judging alone makes many calls per question. Wait for "
+                "the rolling daily limit to free up, or try fewer questions "
+                "next time."
             )
 
 # ── Section 3: latest run — terminal panel ─────────────────────────────────────
@@ -661,13 +703,20 @@ st.markdown('<div class="sec">LLM judge configuration</div>',
 if GROQ_JUDGE_AVAILABLE:
     st.markdown("""
     <div class="info-box">
-        This page scores answers using <b>Llama 3.3 (via Groq)</b> as the RAGAS
-        judge, and the same local <b>all-MiniLM-L6-v2</b> embedding model used
-        for retrieval — no OpenAI key required. Groq is called directly through
-        a small custom LangChain-compatible wrapper rather than the
-        <code>langchain_groq</code> package, which cannot be installed
-        alongside <code>ragas==0.1.21</code> due to a version conflict. This is
-        wired in automatically for every run above.
+        This page scores answers using <b>Llama 3.1 8B (via Groq)</b> as the
+        RAGAS judge, and the same local <b>all-MiniLM-L6-v2</b> embedding model
+        used for retrieval — no OpenAI key required. The judge deliberately
+        uses a smaller model than the main chat (Llama 3.3 70B): Groq tracks
+        daily token quotas separately per model, so judging draws from its
+        own much larger budget instead of competing with the answers, baseline
+        tests, and experiment runs already using the 70B model elsewhere in
+        this app. The answers being judged still come from the real system
+        under test — only the judge's own internal scoring calls use the
+        smaller model. Groq is called directly through a small custom
+        LangChain-compatible wrapper rather than the <code>langchain_groq</code>
+        package, which cannot be installed alongside <code>ragas==0.1.21</code>
+        due to a version conflict. This is wired in automatically for every
+        run above.
     </div>
     """, unsafe_allow_html=True)
 else:
