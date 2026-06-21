@@ -102,6 +102,7 @@ try:
     from langchain_core.language_models.llms import LLM
     from groq import Groq as GroqClient
     from typing import Optional, List, Any
+    import time
 
     @st.cache_resource
     def _get_groq_client():
@@ -110,7 +111,17 @@ try:
 
     class _GroqLLM(LLM):
         """Minimal LangChain-compatible LLM wrapper around the Groq SDK,
-        used as the RAGAS judge in place of langchain_groq."""
+        used as the RAGAS judge in place of langchain_groq.
+
+        RAGAS fires many calls per question (claim extraction, claim
+        verification, reverse-question generation, per-chunk relevance
+        judging) — easily 15-20+ calls per question. On a free-tier Groq
+        key this can exceed the requests-per-minute limit, and RAGAS
+        silently records any failed call as NaN rather than raising —
+        which is why a "successful" run can come back with every score
+        as NaN. Retrying with backoff here absorbs those transient
+        rate-limit failures instead of letting them turn into NaN.
+        """
         model: str = "llama-3.3-70b-versatile"
         temperature: float = 0.0
 
@@ -119,13 +130,20 @@ try:
             return "groq-custom"
 
         def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> str:
-            client   = _get_groq_client()
-            response = client.chat.completions.create(
-                model=self.model,
-                temperature=self.temperature,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return response.choices[0].message.content
+            client     = _get_groq_client()
+            last_error = None
+            for attempt in range(4):
+                try:
+                    response = client.chat.completions.create(
+                        model=self.model,
+                        temperature=self.temperature,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    return response.choices[0].message.content
+                except Exception as e:
+                    last_error = e
+                    time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s backoff
+            raise last_error
 
     class _LocalEmbeddings:
         """Minimal LangChain-compatible embeddings wrapper around the
@@ -140,6 +158,15 @@ try:
         judge_llm        = LangchainLLMWrapper(_GroqLLM())
         judge_embeddings = LangchainEmbeddingsWrapper(_LocalEmbeddings())
         return judge_llm, judge_embeddings
+
+    def test_groq_judge():
+        """Pre-flight check — confirms the judge can actually reach Groq
+        before burning a full 20-question RAGAS run on a broken setup."""
+        try:
+            reply = _GroqLLM()._call("Reply with exactly one word: OK")
+            return True, reply
+        except Exception as e:
+            return False, str(e)
 
 except ImportError as e:
     GROQ_JUDGE_AVAILABLE = False
@@ -256,6 +283,23 @@ def load_ragas_results():
     conn.close()
     return df
 
+def delete_failed_results():
+    """Removes rows where overall is NaN/NULL — leftover from runs where
+    every Groq judge call failed (e.g. rate limiting) before the retry
+    and throttling fix was added. Uses pandas isna() rather than a SQL
+    NULL check, since a NaN saved before this fix is stored as an actual
+    IEEE NaN float, not a SQL NULL — `WHERE overall IS NULL` would miss it."""
+    df = load_ragas_results()
+    if df.empty or "overall" not in df.columns:
+        return
+    bad_ids = df.loc[df["overall"].isna(), "id"].tolist()
+    if not bad_ids:
+        return
+    conn = sqlite3.connect(DB)
+    conn.executemany("DELETE FROM ragas_results WHERE id = ?", [(i,) for i in bad_ids])
+    conn.commit()
+    conn.close()
+
 init_ragas_table()
 
 # ── Check index status ──────────────────────────────────────────────────────────
@@ -320,6 +364,16 @@ st.markdown('<div class="sec">2. Run evaluation</div>', unsafe_allow_html=True)
 
 if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True):
 
+    if GROQ_JUDGE_AVAILABLE:
+        with st.spinner("Checking the Groq judge can be reached..."):
+            judge_ok, judge_msg = test_groq_judge()
+        if not judge_ok:
+            st.error(
+                f"The Groq judge failed its pre-flight check, so this run "
+                f"would just come back as all NaN. Fix this before running:\n\n{judge_msg}"
+            )
+            st.stop()
+
     if indexed_paths:
         with st.spinner(f"Preparing index for chunk size {chunk_size}..."):
             rag.build_index(indexed_paths, chunk_size=chunk_size)
@@ -342,7 +396,8 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
         data["ground_truth"].append("")
 
     prog.empty()
-    st.success("Answers generated. Running RAGAS scoring...")
+    st.success("Answers generated. Running RAGAS scoring — this can take a few "
+                "minutes since each question triggers many judge calls...")
 
     if not GROQ_JUDGE_AVAILABLE:
         st.warning(
@@ -356,11 +411,24 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
 
         if GROQ_JUDGE_AVAILABLE:
             judge_llm, judge_embeddings = get_ragas_judge()
+            # max_workers throttles how many judge calls RAGAS fires at
+            # once. The default is high enough to burst past a free-tier
+            # Groq rate limit instantly, which is what was producing the
+            # all-NaN results — every call failed, RAGAS just silently
+            # recorded NaN instead of stopping. Lower concurrency here
+            # plus the retry/backoff in _GroqLLM together absorb that.
+            try:
+                from ragas.run_config import RunConfig
+                run_config = RunConfig(max_workers=2, timeout=120)
+            except ImportError:
+                run_config = None
+
             result = evaluate(
                 dataset,
                 metrics=[faithfulness, answer_relevancy, context_precision],
                 llm=judge_llm,
                 embeddings=judge_embeddings,
+                run_config=run_config,
             )
         else:
             result = evaluate(
@@ -371,10 +439,34 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
         # RAGAS returns raw scores on a 0-1 scale — converted here to a
         # 0-100% scale so they read the same way as accuracy, precision,
         # and recall are conventionally reported.
-        faith   = round(float(result["faithfulness"]) * 100, 1)
-        relev   = round(float(result["answer_relevancy"]) * 100, 1)
-        prec    = round(float(result["context_precision"]) * 100, 1)
-        overall = round((faith + relev + prec) / 3, 1)
+        import math
+        raw_faith = float(result["faithfulness"])
+        raw_relev = float(result["answer_relevancy"])
+        raw_prec  = float(result["context_precision"])
+
+        if math.isnan(raw_faith) and math.isnan(raw_relev) and math.isnan(raw_prec):
+            st.error(
+                "RAGAS returned NaN for every metric — every judge call failed "
+                "during scoring, most likely Groq rate-limiting from the burst "
+                "of calls this run makes. Nothing was saved. Try again with "
+                "fewer questions (e.g. 5), or wait a minute for your rate "
+                "limit to reset before retrying."
+            )
+            st.stop()
+
+        faith   = round(raw_faith * 100, 1) if not math.isnan(raw_faith) else None
+        relev   = round(raw_relev * 100, 1) if not math.isnan(raw_relev) else None
+        prec    = round(raw_prec * 100, 1)  if not math.isnan(raw_prec)  else None
+
+        if None in (faith, relev, prec):
+            st.warning(
+                "One or more metrics came back as NaN (partial judge "
+                "failures) — the saved result below has a gap. Consider "
+                "re-running this experiment."
+            )
+
+        scored  = [v for v in (faith, relev, prec) if v is not None]
+        overall = round(sum(scored) / len(scored), 1) if scored else None
 
         save_ragas_result(exp_id, chunk_size, top_k, faith, relev, prec, overall, len(questions_to_run))
 
@@ -403,6 +495,9 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
 if "ragas_latest" in st.session_state:
     r = st.session_state.ragas_latest
 
+    def _fmt(v):
+        return f"{v}%" if v is not None else "—"
+
     st.markdown('<div class="sec">3. Latest result</div>', unsafe_allow_html=True)
 
     st.markdown(f"""
@@ -410,20 +505,20 @@ if "ragas_latest" in st.session_state:
         <div class="score-title">READDOC AI — RAGAS EVALUATION RESULTS [{r['experiment']}]</div>
         <div class="score-row">
             <span class="score-label">Faithfulness</span>
-            <span class="score-val">{r['faithfulness']}%</span>
+            <span class="score-val">{_fmt(r['faithfulness'])}</span>
         </div>
         <div class="score-row">
             <span class="score-label">Answer Relevancy</span>
-            <span class="score-val">{r['answer_relevancy']}%</span>
+            <span class="score-val">{_fmt(r['answer_relevancy'])}</span>
         </div>
         <div class="score-row">
             <span class="score-label">Context Precision</span>
-            <span class="score-val">{r['context_precision']}%</span>
+            <span class="score-val">{_fmt(r['context_precision'])}</span>
         </div>
         <div class="score-divider"></div>
         <div class="score-row">
             <span class="score-label">Overall</span>
-            <span class="score-overall">{r['overall']}%</span>
+            <span class="score-overall">{_fmt(r['overall'])}</span>
         </div>
         <div class="score-divider"></div>
         <div class="score-row">
@@ -438,9 +533,13 @@ if "ragas_latest" in st.session_state:
         ("Answer Relevancy", r["answer_relevancy"]),
         ("Context Precision", r["context_precision"]),
     ]:
-        colour = "#059669" if val >= 80 else "#C2410C" if val < 60 else "#1a56db"
+        if val is None:
+            colour, display = "#9CA3AF", "—"
+        else:
+            colour  = "#059669" if val >= 80 else "#C2410C" if val < 60 else "#1a56db"
+            display = f"{val}%"
         st.markdown(
-            f'<div class="mc"><div class="mc-val" style="color:{colour}">{val}%</div>'
+            f'<div class="mc"><div class="mc-val" style="color:{colour}">{display}</div>'
             f'<div class="mc-label">{label}</div></div>',
             unsafe_allow_html=True,
         )
@@ -461,6 +560,20 @@ if df_ragas.empty:
     </div>
     """, unsafe_allow_html=True)
 else:
+    n_failed = int(df_ragas["overall"].isna().sum())
+    if n_failed > 0:
+        col_a, col_b = st.columns([4, 1])
+        with col_a:
+            st.warning(
+                f"{n_failed} saved result(s) have no overall score — these are "
+                f"from runs where the Groq judge failed entirely (rate limiting "
+                f"or a setup issue), before the retry/throttling fix was added."
+            )
+        with col_b:
+            if st.button("Clear failed", use_container_width=True):
+                delete_failed_results()
+                st.rerun()
+
     st.markdown("**Full results table**")
     display_df = df_ragas[[
         "experiment", "chunk_size", "top_k",
@@ -485,37 +598,46 @@ else:
         }
     )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Overall RAGAS score per experiment**")
-        chart_df = df_ragas.set_index("experiment")["overall"].rename("Overall score")
-        st.bar_chart(chart_df, color="#1a56db", height=280)
-        st.caption("Higher is better — combined average of all three metrics")
+    # Charts and the "best configuration" callout only use rows that
+    # actually have a real overall score — failed (NaN) rows are excluded
+    # rather than crashing idxmax() or rendering empty bars.
+    valid_df = df_ragas.dropna(subset=["overall"])
 
-    with col2:
-        st.markdown("**All three metrics, side by side**")
-        metrics_df = df_ragas.set_index("experiment")[
-            ["faithfulness", "answer_relevancy", "context_precision"]
-        ]
-        metrics_df.columns = ["Faithfulness", "Answer Relevancy", "Context Precision"]
-        st.bar_chart(metrics_df, height=280)
-        st.caption("Shows which metric drives the overall score for each configuration")
+    if valid_df.empty:
+        st.info("No successfully-scored experiments yet to chart — clear the "
+                "failed result(s) above and run again.")
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Overall RAGAS score per experiment**")
+            chart_df = valid_df.set_index("experiment")["overall"].rename("Overall score")
+            st.bar_chart(chart_df, color="#1a56db", height=280)
+            st.caption("Higher is better — combined average of all three metrics")
 
-    if len(df_ragas) >= 2:
-        st.markdown("**Chunk size vs average RAGAS score**")
-        chunk_avg = df_ragas.groupby("chunk_size")["overall"].mean().reset_index()
-        chunk_avg["chunk_size"] = chunk_avg["chunk_size"].astype(str) + " chars"
-        st.bar_chart(chunk_avg.set_index("chunk_size")["overall"], color="#1D9E75", height=240)
+        with col2:
+            st.markdown("**All three metrics, side by side**")
+            metrics_df = valid_df.set_index("experiment")[
+                ["faithfulness", "answer_relevancy", "context_precision"]
+            ]
+            metrics_df.columns = ["Faithfulness", "Answer Relevancy", "Context Precision"]
+            st.bar_chart(metrics_df, height=280)
+            st.caption("Shows which metric drives the overall score for each configuration")
 
-    best_row = df_ragas.loc[df_ragas["overall"].idxmax()]
-    st.markdown(f"""
-    <div class="info-box">
-        Best configuration so far: <b>{best_row['experiment']}</b>
-        (chunk {int(best_row['chunk_size'])}, k={int(best_row['top_k'])})
-        with an overall RAGAS score of <b>{best_row['overall']}%</b>.
-        Evaluated {len(df_ragas)} of 9 experiment configurations.
-    </div>
-    """, unsafe_allow_html=True)
+        if len(valid_df) >= 2:
+            st.markdown("**Chunk size vs average RAGAS score**")
+            chunk_avg = valid_df.groupby("chunk_size")["overall"].mean().reset_index()
+            chunk_avg["chunk_size"] = chunk_avg["chunk_size"].astype(str) + " chars"
+            st.bar_chart(chunk_avg.set_index("chunk_size")["overall"], color="#1D9E75", height=240)
+
+        best_row = valid_df.loc[valid_df["overall"].idxmax()]
+        st.markdown(f"""
+        <div class="info-box">
+            Best configuration so far: <b>{best_row['experiment']}</b>
+            (chunk {int(best_row['chunk_size'])}, k={int(best_row['top_k'])})
+            with an overall RAGAS score of <b>{best_row['overall']}%</b>.
+            Evaluated {len(valid_df)} of 9 experiment configurations.
+        </div>
+        """, unsafe_allow_html=True)
 
     csv = df_ragas.to_csv(index=False)
     st.download_button(
