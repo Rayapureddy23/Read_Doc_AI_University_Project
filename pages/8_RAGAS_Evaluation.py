@@ -1,8 +1,6 @@
 """
 8_RAGAS_Evaluation.py — Automated RAG Evaluation using RAGAS
 ==============================================================
-
-
 Runs RAGAS scoring for a chosen experiment configuration (E1-E9), saves
 the result to the shared experiments database, displays a terminal-style
 score panel for the latest run, and plots comparison charts across every
@@ -84,70 +82,52 @@ if not RAGAS_AVAILABLE:
     st.code("pip install ragas datasets", language="bash")
     st.stop()
 
-# ── RAGAS judge setup — uses Groq (already in this project) instead of
-# OpenAI, which RAGAS defaults to and which this project has no key for.
+# ── RAGAS judge setup — uses Gemini instead of OpenAI (which RAGAS
+# defaults to and which this project has no key for). Groq has been
+# fully removed from this project after repeated daily-quota walls.
 #
-# NOTE: we deliberately do NOT use the langchain_groq package here.
-# ragas==0.1.21 requires langchain-core<0.3, but every published version
-# of langchain_groq (even the very first, 0.2.0) requires langchain-core
-# >=0.3 — there is no version of langchain_groq that can ever satisfy
-# both constraints at once, so pip's resolver always fails. Instead we
-# talk to Groq directly with the `groq` SDK (already a dependency) and
-# wrap it in a small custom class implementing LangChain's plain LLM
-# interface, which ragas's LangchainLLMWrapper accepts natively.
-GROQ_JUDGE_AVAILABLE = True
-groq_judge_error = None
+# Same approach as before: a small custom class implementing LangChain's
+# plain LLM interface, talking to Gemini's SDK directly, rather than
+# pulling in the langchain-google-genai package — that package tracks
+# the same fast-moving langchain-core releases that made langchain_groq
+# unusable alongside ragas==0.1.21 (which pins langchain-core<0.3), so
+# the same direct-SDK-wrapper approach avoids that whole class of
+# dependency conflict again.
+GEMINI_JUDGE_AVAILABLE = True
+gemini_judge_error = None
 try:
     from ragas.llms import LangchainLLMWrapper
     from ragas.embeddings import LangchainEmbeddingsWrapper
     from langchain_core.language_models.llms import LLM
-    from groq import Groq as GroqClient
+    import google.generativeai as genai
     from typing import Optional, List, Any
     import time
 
-    @st.cache_resource
-    def _get_groq_client():
-        groq_key = st.secrets.get("GROQ_API_KEY") or os.environ.get("GROQ_API_KEY")
-        return GroqClient(api_key=groq_key)
+    _GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if _GOOGLE_API_KEY:
+        genai.configure(api_key=_GOOGLE_API_KEY)
 
-    class _GroqLLM(LLM):
-        """Minimal LangChain-compatible LLM wrapper around the Groq SDK,
-        used as the RAGAS judge in place of langchain_groq.
-
-        Deliberately uses llama-3.1-8b-instant rather than the main
-        chat model (llama-3.3-70b-versatile). Groq tracks daily token
-        quotas separately per model, and the 8B model's quota is far
-        larger than the 70B model's — so judging draws from its own
-        untouched budget instead of competing with the actual chat
-        answers, baseline tests, and experiment runs that already use
-        llama-3.3-70b-versatile elsewhere in this app. RAGAS's judge
-        tasks (yes/no claim verification, short paraphrase generation,
-        1-5 relevance ratings) don't need 70B-class reasoning, so this
-        doesn't cost meaningful judging accuracy.
-        """
-        model: str = "llama-3.1-8b-instant"
-        temperature: float = 0.0
+    class _GeminiLLM(LLM):
+        """Minimal LangChain-compatible LLM wrapper around the Gemini
+        SDK, used as the RAGAS judge."""
+        model: str = "gemini-2.5-flash"
 
         @property
         def _llm_type(self) -> str:
-            return "groq-custom"
+            return "gemini-custom"
 
         def _call(self, prompt: str, stop: Optional[List[str]] = None,
                   run_manager: Optional[Any] = None, **kwargs: Any) -> str:
             # LangChain's LLM base class calls _call(prompt, stop, run_manager)
-            # positionally — a signature missing run_manager crashes with
-            # "takes from 2 to 3 positional arguments but 4 were given" on
-            # every single invocation, which is what was happening here.
-            client     = _get_groq_client()
+            # positionally — this signature must include run_manager or it
+            # crashes on every single invocation (learned the hard way with
+            # the previous Groq wrapper).
             last_error = None
             for attempt in range(3):
                 try:
-                    response = client.chat.completions.create(
-                        model=self.model,
-                        temperature=self.temperature,
-                        messages=[{"role": "user", "content": prompt}],
-                    )
-                    return response.choices[0].message.content
+                    gemini_model = genai.GenerativeModel(self.model)
+                    response = gemini_model.generate_content(prompt)
+                    return response.text
                 except Exception as e:
                     last_error = e
                     time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
@@ -163,22 +143,25 @@ try:
             return rag.get_embedding_model().encode([text])[0].tolist()
 
     def get_ragas_judge():
-        judge_llm        = LangchainLLMWrapper(_GroqLLM())
+        judge_llm        = LangchainLLMWrapper(_GeminiLLM())
         judge_embeddings = LangchainEmbeddingsWrapper(_LocalEmbeddings())
         return judge_llm, judge_embeddings
 
-    def test_groq_judge():
-        """Pre-flight check — confirms the judge can actually reach Groq
-        before burning a full 20-question RAGAS run on a broken setup."""
+    def test_gemini_judge():
+        """Pre-flight check — confirms the judge can actually reach
+        Gemini before burning a full 20-question RAGAS run on a broken
+        setup (e.g. a bad API key)."""
+        if not _GOOGLE_API_KEY:
+            return False, "GOOGLE_API_KEY not set in secrets"
         try:
-            reply = _GroqLLM()._call("Reply with exactly one word: OK")
+            reply = _GeminiLLM()._call("Reply with exactly one word: OK")
             return True, reply
         except Exception as e:
             return False, str(e)
 
 except ImportError as e:
-    GROQ_JUDGE_AVAILABLE = False
-    groq_judge_error = str(e)
+    GEMINI_JUDGE_AVAILABLE = False
+    gemini_judge_error = str(e)
 
 st.markdown("""
 <div class="info-box">
@@ -372,12 +355,12 @@ st.markdown('<div class="sec">2. Run evaluation</div>', unsafe_allow_html=True)
 
 if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True):
 
-    if GROQ_JUDGE_AVAILABLE:
-        with st.spinner("Checking the Groq judge can be reached..."):
-            judge_ok, judge_msg = test_groq_judge()
+    if GEMINI_JUDGE_AVAILABLE:
+        with st.spinner("Checking the Gemini judge can be reached..."):
+            judge_ok, judge_msg = test_gemini_judge()
         if not judge_ok:
             st.error(
-                f"The Groq judge failed its pre-flight check, so this run "
+                f"The Gemini judge failed its pre-flight check, so this run "
                 f"would just come back as all NaN. Fix this before running:\n\n{judge_msg}"
             )
             st.stop()
@@ -406,26 +389,24 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
     except Exception as e:
         prog.empty()
         err_str = str(e)
-        if "rate_limit" in err_str.lower() or "429" in err_str or "tokens per day" in err_str.lower():
+        if "rate_limit" in err_str.lower() or "429" in err_str or "quota" in err_str.lower():
             st.error(
                 f"Generated {len(data['question'])}/{len(questions_to_run)} answers, "
-                "then hit Groq's daily token quota — this is a free-tier usage "
-                "limit, not a bug in the app."
+                "then hit Gemini's free-tier rate limit — a usage limit, "
+                "not a bug in the app."
             )
             st.markdown("""
             <div class="info-box">
-                RAGAS evaluation is token-heavy: every question needs one full
-                answer generation call, <i>plus</i> many extra judge calls per
-                question (claim extraction, claim verification, reverse-question
-                generation, per-chunk relevance checks). Combined with earlier
-                testing today, that adds up fast on a free-tier daily limit.
+                RAGAS evaluation makes many calls per question on top of the
+                answer itself: claim extraction, claim verification,
+                reverse-question generation, per-chunk relevance checks.
+                Gemini's free tier is generous (1,500 requests/day) but still
+                has a per-minute cap.
                 <br><br>
-                <b>Options:</b> wait — Groq's daily limit is a rolling 24h
-                window, so quota frees up gradually rather than all at once
-                tomorrow; try evaluating fewer questions at a time (5 instead
-                of 20) to spread token use across more days; or upgrade to
-                Groq's Dev Tier for a higher daily limit at
-                console.groq.com/settings/billing.
+                <b>Options:</b> wait a minute or two and try again — this is
+                usually a short per-minute limit, not a full daily quota;
+                or evaluate fewer questions at a time (5 instead of 20) if
+                it keeps happening.
             </div>
             """, unsafe_allow_html=True)
             with st.expander("Technical details"):
@@ -438,9 +419,9 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
     st.success("Answers generated. Running RAGAS scoring — this can take a few "
                 "minutes since each question triggers many judge calls...")
 
-    if not GROQ_JUDGE_AVAILABLE:
+    if not GEMINI_JUDGE_AVAILABLE:
         st.warning(
-            f"Groq judge setup failed ({groq_judge_error}), so RAGAS will "
+            f"Gemini judge setup failed ({gemini_judge_error}), so RAGAS will "
             "fall back to its OpenAI default judge and fail without an "
             "OpenAI key."
         )
@@ -448,14 +429,12 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
     try:
         dataset = Dataset.from_dict(data)
 
-        if GROQ_JUDGE_AVAILABLE:
+        if GEMINI_JUDGE_AVAILABLE:
             judge_llm, judge_embeddings = get_ragas_judge()
             # max_workers throttles how many judge calls RAGAS fires at
-            # once. The default is high enough to burst past a free-tier
-            # Groq rate limit instantly, which is what was producing the
-            # all-NaN results — every call failed, RAGAS just silently
-            # recorded NaN instead of stopping. Lower concurrency here
-            # plus the retry/backoff in _GroqLLM together absorb that.
+            # once, to stay comfortably under Gemini's per-minute rate
+            # limit rather than bursting past it. The retry/backoff in
+            # _GeminiLLM absorbs any transient failures on top of this.
             try:
                 from ragas.run_config import RunConfig
                 run_config = RunConfig(max_workers=3, timeout=180)
@@ -486,7 +465,7 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
         if math.isnan(raw_faith) and math.isnan(raw_relev) and math.isnan(raw_prec):
             st.error(
                 "RAGAS returned NaN for every metric — every judge call failed "
-                "during scoring, most likely Groq rate-limiting from the burst "
+                "during scoring, most likely Gemini rate-limiting from the burst "
                 "of calls this run makes. Nothing was saved. Try again with "
                 "fewer questions (e.g. 5), or wait a minute for your rate "
                 "limit to reset before retrying."
@@ -526,16 +505,16 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
         st.error(f"RAGAS scoring failed: {err_str}")
         if "openai" in err_str.lower() or "api_key" in err_str.lower():
             st.info(
-                "This looks like RAGAS tried to use OpenAI instead of Groq. "
-                "Check that your GROQ_API_KEY is set in "
-                ".streamlit/secrets.toml — that is the only key this judge needs."
+                "This looks like RAGAS tried to use OpenAI instead of Gemini. "
+                "Check that your GOOGLE_API_KEY is set in "
+                ".streamlit/secrets.toml AND Streamlit Cloud's Settings → "
+                "Secrets — that is the only key this judge needs."
             )
-        elif "rate_limit" in err_str.lower() or "429" in err_str or "tokens per day" in err_str.lower():
+        elif "rate_limit" in err_str.lower() or "429" in err_str or "quota" in err_str.lower():
             st.info(
-                "This is Groq's daily token quota being exhausted mid-run — "
+                "This is Gemini's daily quota being exhausted mid-run — "
                 "RAGAS judging alone makes many calls per question. Wait for "
-                "the rolling daily limit to free up, or try fewer questions "
-                "next time."
+                "the daily limit to reset, or try fewer questions next time."
             )
 
 # ── Section 3: latest run — terminal panel ─────────────────────────────────────
@@ -700,31 +679,29 @@ else:
 st.markdown('<div class="sec">LLM judge configuration</div>',
             unsafe_allow_html=True)
 
-if GROQ_JUDGE_AVAILABLE:
+if GEMINI_JUDGE_AVAILABLE:
     st.markdown("""
     <div class="info-box">
-        This page scores answers using <b>Llama 3.1 8B (via Groq)</b> as the
-        RAGAS judge, and the same local <b>all-MiniLM-L6-v2</b> embedding model
-        used for retrieval — no OpenAI key required. The judge deliberately
-        uses a smaller model than the main chat (Llama 3.3 70B): Groq tracks
-        daily token quotas separately per model, so judging draws from its
-        own much larger budget instead of competing with the answers, baseline
-        tests, and experiment runs already using the 70B model elsewhere in
-        this app. The answers being judged still come from the real system
-        under test — only the judge's own internal scoring calls use the
-        smaller model. Groq is called directly through a small custom
-        LangChain-compatible wrapper rather than the <code>langchain_groq</code>
-        package, which cannot be installed alongside <code>ragas==0.1.21</code>
-        due to a version conflict. This is wired in automatically for every
-        run above.
+        This page scores answers using <b>Gemini 2.5 Flash</b> as the RAGAS
+        judge, and the same local <b>all-MiniLM-L6-v2</b> embedding model
+        used for retrieval — no OpenAI key required. Groq has been fully
+        removed from this project; Gemini's free tier (1,500 requests/day,
+        no credit card) is far more generous than Groq's daily quota was,
+        which is why evaluation runs kept stalling before this switch.
+        Gemini is called directly through a small custom LangChain-compatible
+        wrapper, avoiding any extra package that could conflict with
+        <code>ragas==0.1.21</code>'s pinned <code>langchain-core</code>
+        version. This is wired in automatically for every run above.
     </div>
     """, unsafe_allow_html=True)
 else:
     st.markdown(f"""
     <div class="info-box" style="background:#FFF7ED;border-color:#FED7AA;color:#92400E">
-        <b>Could not set up the Groq judge</b> ({groq_judge_error}).
+        <b>Could not set up the Gemini judge</b> ({gemini_judge_error}).
         RAGAS will fall back to its OpenAI default and fail without an
-        OpenAI key. This usually means <code>langchain-core</code> or
-        <code>groq</code> failed to install — check your requirements.txt.
+        OpenAI key. Check that <code>GOOGLE_API_KEY</code> is set in both
+        your local <code>.streamlit/secrets.toml</code> and Streamlit
+        Cloud's Settings → Secrets (these are separate stores — the
+        deployed app needs its own copy, and a reboot after adding it).
     </div>
     """, unsafe_allow_html=True)
