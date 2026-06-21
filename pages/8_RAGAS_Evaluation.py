@@ -1,6 +1,6 @@
 """
 8_RAGAS_Evaluation.py — Automated RAG Evaluation using RAGAS
-==============================================================
+
 
 Runs RAGAS scoring for a chosen experiment configuration (E1-E9), saves
 the result to the shared experiments database, displays a terminal-style
@@ -129,10 +129,15 @@ try:
         def _llm_type(self) -> str:
             return "groq-custom"
 
-        def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs: Any) -> str:
+        def _call(self, prompt: str, stop: Optional[List[str]] = None,
+                  run_manager: Optional[Any] = None, **kwargs: Any) -> str:
+            # LangChain's LLM base class calls _call(prompt, stop, run_manager)
+            # positionally — a signature missing run_manager crashes with
+            # "takes from 2 to 3 positional arguments but 4 were given" on
+            # every single invocation, which is what was happening here.
             client     = _get_groq_client()
             last_error = None
-            for attempt in range(4):
+            for attempt in range(3):
                 try:
                     response = client.chat.completions.create(
                         model=self.model,
@@ -142,7 +147,7 @@ try:
                     return response.choices[0].message.content
                 except Exception as e:
                     last_error = e
-                    time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s backoff
+                    time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
             raise last_error
 
     class _LocalEmbeddings:
@@ -419,7 +424,7 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
             # plus the retry/backoff in _GroqLLM together absorb that.
             try:
                 from ragas.run_config import RunConfig
-                run_config = RunConfig(max_workers=2, timeout=120)
+                run_config = RunConfig(max_workers=3, timeout=180)
             except ImportError:
                 run_config = None
 
