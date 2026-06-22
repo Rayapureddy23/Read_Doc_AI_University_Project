@@ -1,0 +1,573 @@
+"""
+9_Local_Metrics.py — Zero-Cost Automated Evaluation
+
+
+Two automated evaluation methods that use NO LLM API calls at all beyond
+generating the answers themselves (which the experiment needs regardless).
+This makes them immune to Gemini's daily quota — they can be re-run
+as many times as needed, any time of day.
+
+1. SEMANTIC ANSWER SIMILARITY
+   Cosine similarity between each generated answer and a short reference
+   answer, computed with the same local sentence-transformers model
+   already used for retrieval. For out-of-scope questions, the reference
+   answer is the ideal refusal text — so this also rewards a system for
+   correctly declining to answer, and penalises hallucination.
+
+2. RETRIEVAL PRECISION / RECALL / MRR
+   Classic information-retrieval metrics. For each in-scope question, you
+   record which page(s) of the source document actually contain the
+   answer. The system then checks whether the chunks FAISS retrieved
+   actually came from those pages — entirely computed from rag.search()
+   output, no model involved at all beyond the embedding lookup itself.
+
+Both require you to fill in ground truth ONCE (reference answers + page
+numbers) — saved to the database so you never need to re-enter it.
+"""
+
+import streamlit as st
+import sys, os, sqlite3
+import pandas as pd
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import rag
+from llm import ask_llama
+
+st.set_page_config(page_title="Local Metrics — ReadDoc AI", page_icon="🔵", layout="wide")
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+html,body,[class*="css"]{font-family:'DM Sans',sans-serif!important}
+.stApp{background:#F0F4FF}
+.main .block-container{background:#fff;border-radius:16px;margin:1rem;
+    padding:2.5rem 3rem!important;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.page-badge{display:inline-block;background:#ECFDF5;color:#059669;font-size:12px;
+    font-weight:600;padding:4px 12px;border-radius:20px;text-transform:uppercase;
+    letter-spacing:.06em;margin-bottom:10px}
+.page-title{font-size:24px;font-weight:700;color:#111827;margin-bottom:6px}
+.page-sub{font-size:14px;color:#6B7280;margin-bottom:1.5rem;line-height:1.6}
+.sec{font-size:17px;font-weight:600;color:#111827;margin:2rem 0 .8rem;
+    padding-bottom:8px;border-bottom:2px solid #EEF2FF}
+.score-box{background:#0a0a0a;border-radius:12px;padding:28px 32px;
+    font-family:'DM Mono',monospace;color:#fff;margin:1rem 0}
+.score-title{font-size:13px;font-weight:600;color:#fff;margin-bottom:16px;
+    border-bottom:1px solid #333;padding-bottom:8px;letter-spacing:.08em}
+.score-row{display:flex;justify-content:space-between;padding:4px 0;
+    font-size:14px;color:#fff}
+.score-label{color:#ccc}
+.score-val{color:#4ade80;font-weight:600}
+.score-overall{color:#facc15;font-weight:700;font-size:16px}
+.score-divider{border-top:1px solid #333;margin:8px 0}
+.info-box{background:#ECFDF5;border:.5px solid #A7F3D0;border-radius:10px;
+    padding:14px 18px;font-size:13px;color:#065f46;margin-bottom:1.5rem;line-height:1.6}
+.metric-compare{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin:1rem 0}
+.mc{background:#F8FAFF;border:.5px solid #E5E9F5;border-radius:10px;padding:14px 16px;text-align:center}
+.mc-val{font-size:26px;font-weight:700;color:#059669;margin-bottom:4px}
+.mc-label{font-size:11px;color:#6B7280}
+.empty-box{text-align:center;padding:2.5rem;color:#9CA3AF;background:#F8FAFF;
+    border-radius:12px;border:1px dashed #C7D3F5}
+.gt-card{background:#F8FAFF;border:.5px solid #E5E9F5;border-radius:10px;
+    padding:14px 18px;margin-bottom:10px}
+.gt-q{font-size:13px;font-weight:600;color:#111827;margin-bottom:6px}
+.gt-cat{display:inline-block;font-size:10px;font-weight:600;padding:2px 8px;
+    border-radius:10px;margin-left:8px;text-transform:uppercase;letter-spacing:.04em}
+.cat-factual{background:#EEF2FF;color:#1a56db}
+.cat-multi{background:#FAEEDA;color:#854F0B}
+.cat-inferential{background:#F0EBFA;color:#534AB7}
+.cat-oos{background:#FAECE7;color:#993C1D}
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="page-badge">Zero-cost automated evaluation</div>
+<div class="page-title">Local metrics</div>
+<div class="page-sub">
+    Semantic answer similarity and retrieval precision/recall/MRR — computed
+    entirely with the local embedding model already used for retrieval.
+    No LLM judge, no extra API calls, no rate limits. Can be re-run as many
+    times as needed.
+</div>
+""", unsafe_allow_html=True)
+
+# ── Check index status ──────────────────────────────────────────────────────────
+status        = rag.get_status()
+indexed_paths = st.session_state.get("indexed_file_paths")
+
+if not indexed_paths and not status["loaded"]:
+    st.markdown("""
+    <div class="empty-box">
+        <b style="color:#374151;font-size:15px">No document indexed yet</b><br><br>
+        Go to the main ReadDoc AI page, upload your document, and click
+        "Build index — all chunk sizes" first. Then come back here.
+    </div>
+    """, unsafe_allow_html=True)
+    st.stop()
+
+# ── The 20 standard test questions, with category metadata ────────────────────
+TEST_QUESTIONS = [
+    {"id": 1,  "q": "What is the difference between supervised and unsupervised learning?", "cat": "factual"},
+    {"id": 2,  "q": "What is the bias-variance tradeoff in statistical learning?", "cat": "factual"},
+    {"id": 3,  "q": "How does k-fold cross-validation work?", "cat": "factual"},
+    {"id": 4,  "q": "How does the K-Means algorithm work?", "cat": "factual"},
+    {"id": 5,  "q": "What is Principal Component Analysis (PCA) and what is it used for?", "cat": "factual"},
+    {"id": 6,  "q": "What is the difference between regression and classification?", "cat": "multi"},
+    {"id": 7,  "q": "What evaluation metrics are used for classification models?", "cat": "multi"},
+    {"id": 8,  "q": "What is the difference between Bagging and Random Forests?", "cat": "multi"},
+    {"id": 9,  "q": "How do feed-forward neural networks work and how are they trained?", "cat": "multi"},
+    {"id": 10, "q": "How does regularization help prevent overfitting?", "cat": "multi"},
+    {"id": 11, "q": "Why would you use a Random Forest instead of a single decision tree?", "cat": "inferential"},
+    {"id": 12, "q": "What happens to a model when it is too complex or too simple?", "cat": "inferential"},
+    {"id": 13, "q": "What are the two main steps of the EM algorithm?", "cat": "inferential"},
+    {"id": 14, "q": "What are adaptive gradient methods and why are they used in deep learning?", "cat": "inferential"},
+    {"id": 15, "q": "What is the key idea behind how SVMs find a decision boundary?", "cat": "inferential"},
+    {"id": 16, "q": "What is the current version of Python released in 2025?", "cat": "oos"},
+    {"id": 17, "q": "Who won the FIFA World Cup in 2022?", "cat": "oos"},
+    {"id": 18, "q": "What is the stock market price of Nvidia today?", "cat": "oos"},
+    {"id": 19, "q": "What are the system requirements for installing TensorFlow 3.0?", "cat": "oos"},
+    {"id": 20, "q": "What is the weather forecast for Brisbane this weekend?", "cat": "oos"},
+]
+
+CAT_LABELS = {
+    "factual":     ("Factual", "cat-factual"),
+    "multi":       ("Multi-fact", "cat-multi"),
+    "inferential": ("Inferential", "cat-inferential"),
+    "oos":         ("Out-of-scope", "cat-oos"),
+}
+
+DEFAULT_OOS_REFERENCE = (
+    "I cannot answer this from the uploaded documents — this information "
+    "is not covered in the provided source material."
+)
+
+EXPERIMENTS = [
+    ("E1", 300, 3),  ("E2", 300, 5),  ("E3", 300, 10),
+    ("E4", 600, 3),  ("E5", 600, 5),  ("E6", 600, 10),
+    ("E7", 1000, 3), ("E8", 1000, 5), ("E9", 1000, 10),
+]
+
+# ── Database ─────────────────────────────────────────────────────────────────
+DB = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data", "experiments.db"
+)
+
+def init_tables():
+    os.makedirs(os.path.dirname(DB), exist_ok=True)
+    conn = sqlite3.connect(DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS local_ground_truth (
+            question_id        INTEGER PRIMARY KEY,
+            reference_answer   TEXT,
+            ground_truth_pages TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS local_metrics_results (
+            id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment               TEXT NOT NULL,
+            chunk_size               INTEGER,
+            top_k                    INTEGER,
+            semantic_similarity      REAL,
+            retrieval_precision      REAL,
+            retrieval_recall         REAL,
+            mrr                      REAL,
+            overall                  REAL,
+            num_questions            INTEGER,
+            created_at               TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def load_ground_truth():
+    conn = sqlite3.connect(DB)
+    try:
+        df = pd.read_sql_query("SELECT * FROM local_ground_truth", conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    gt = {}
+    for _, row in df.iterrows():
+        gt[int(row["question_id"])] = {
+            "reference_answer":   row["reference_answer"] or "",
+            "ground_truth_pages": row["ground_truth_pages"] or "",
+        }
+    return gt
+
+def save_ground_truth(question_id, reference_answer, ground_truth_pages):
+    conn = sqlite3.connect(DB)
+    conn.execute("""
+        INSERT INTO local_ground_truth (question_id, reference_answer, ground_truth_pages)
+        VALUES (?, ?, ?)
+        ON CONFLICT(question_id) DO UPDATE SET
+            reference_answer = excluded.reference_answer,
+            ground_truth_pages = excluded.ground_truth_pages
+    """, (question_id, reference_answer, ground_truth_pages))
+    conn.commit()
+    conn.close()
+
+def save_local_result(experiment, chunk_size, top_k, sim, prec, rec, mrr, overall, num_q):
+    conn = sqlite3.connect(DB)
+    conn.execute("DELETE FROM local_metrics_results WHERE experiment = ?", (experiment,))
+    conn.execute("""
+        INSERT INTO local_metrics_results
+            (experiment, chunk_size, top_k, semantic_similarity, retrieval_precision,
+             retrieval_recall, mrr, overall, num_questions, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    """, (experiment, chunk_size, top_k, sim, prec, rec, mrr, overall, num_q))
+    conn.commit()
+    conn.close()
+
+def load_local_results():
+    if not os.path.exists(DB):
+        return pd.DataFrame()
+    conn = sqlite3.connect(DB)
+    try:
+        df = pd.read_sql_query("SELECT * FROM local_metrics_results ORDER BY experiment", conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
+init_tables()
+ground_truth = load_ground_truth()
+
+# ── Section 1: ground truth entry ──────────────────────────────────────────────
+filled = sum(
+    1 for q in TEST_QUESTIONS
+    if ground_truth.get(q["id"], {}).get("reference_answer", "").strip()
+)
+st.markdown(f'<div class="sec">1. Ground truth ({filled}/20 reference answers saved)</div>',
+            unsafe_allow_html=True)
+
+st.markdown("""
+<div class="info-box">
+    Fill this in once — it's saved permanently. For Q1-15, write a short
+    correct answer (a sentence or two) and the page number(s) in your PDF
+    that contain it. For Q16-20 (out-of-scope), the reference answer is
+    pre-filled with the ideal refusal — edit it if you'd phrase it
+    differently. Leave page numbers blank for Q16-20; there's nothing in
+    the document for them to correctly point to.
+</div>
+""", unsafe_allow_html=True)
+
+with st.expander(f"Enter / edit ground truth ({filled}/20 done)", expanded=(filled < 20)):
+    for q in TEST_QUESTIONS:
+        existing = ground_truth.get(q["id"], {})
+        default_ref = existing.get("reference_answer", "") or (
+            DEFAULT_OOS_REFERENCE if q["cat"] == "oos" else ""
+        )
+        cat_label, cat_class = CAT_LABELS[q["cat"]]
+
+        st.markdown(
+            f'<div class="gt-q">Q{q["id"]}: {q["q"]} '
+            f'<span class="gt-cat {cat_class}">{cat_label}</span></div>',
+            unsafe_allow_html=True,
+        )
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            ref = st.text_area(
+                f"Reference answer — Q{q['id']}", value=default_ref,
+                key=f"ref_{q['id']}", height=68, label_visibility="collapsed",
+            )
+        with col2:
+            pages = st.text_input(
+                f"Page(s) — Q{q['id']}",
+                value=existing.get("ground_truth_pages", ""),
+                key=f"pages_{q['id']}",
+                placeholder="e.g. 42, 43" if q["cat"] != "oos" else "n/a",
+                disabled=(q["cat"] == "oos"),
+                label_visibility="collapsed",
+            )
+        if st.button(f"Save Q{q['id']}", key=f"save_{q['id']}"):
+            save_ground_truth(q["id"], ref, pages if q["cat"] != "oos" else "")
+            st.rerun()
+        st.markdown("---")
+
+# ── Section 2: select experiment + run ─────────────────────────────────────────
+st.markdown('<div class="sec">2. Run local metrics for an experiment</div>',
+            unsafe_allow_html=True)
+
+if filled < 20:
+    st.warning(
+        f"Only {filled}/20 reference answers saved. You can still run this "
+        "on whatever's filled in, but fill in the rest for a complete picture."
+    )
+
+exp_options = [f"{eid} — Chunk {cs}, k={k}" for eid, cs, k in EXPERIMENTS]
+exp_choice  = st.selectbox("Experiment configuration", exp_options, index=4)
+exp_idx     = exp_options.index(exp_choice)
+exp_id, chunk_size, top_k = EXPERIMENTS[exp_idx]
+
+st.info(f"Will evaluate {exp_id} — chunk size {chunk_size} chars, k={top_k}")
+
+if st.button(f"Run local metrics for {exp_id}", type="primary", use_container_width=True):
+
+    if indexed_paths:
+        with st.spinner(f"Preparing index for chunk size {chunk_size}..."):
+            rag.build_index(indexed_paths, chunk_size=chunk_size)
+
+    model = rag.get_embedding_model()
+
+    sims, precisions, recalls, rr_scores = [], [], [], []
+    prog = st.progress(0, text="Generating answers and scoring...")
+
+    quota_hit = False
+    try:
+        for i, q in enumerate(TEST_QUESTIONS):
+            gt = ground_truth.get(q["id"], {})
+            ref_answer = gt.get("reference_answer", "").strip()
+            gt_pages_raw = gt.get("ground_truth_pages", "").strip()
+
+            if not ref_answer:
+                continue  # skip questions with no ground truth yet
+
+            prog.progress((i + 1) / 20, text=f"Question {q['id']}/20: {q['q'][:50]}...")
+
+            chunks = rag.search(q["q"], top_k=top_k)
+            answer = ask_llama(q["q"], chunks, [])
+
+            # --- Semantic similarity (all questions with a reference answer) ---
+            emb_pair = model.encode([answer, ref_answer])
+            a_vec, r_vec = emb_pair[0], emb_pair[1]
+            cos_sim = float(np.dot(a_vec, r_vec) / (np.linalg.norm(a_vec) * np.linalg.norm(r_vec)))
+            sims.append(max(0.0, cos_sim))
+
+            # --- Retrieval precision / recall / MRR (in-scope questions only) ---
+            if gt_pages_raw:
+                gt_pages = {p.strip() for p in gt_pages_raw.split(",") if p.strip()}
+                retrieved_pages_list = [str(c["page_number"]) for c in chunks]
+                retrieved_pages_set  = set(retrieved_pages_list)
+
+                relevant_retrieved = retrieved_pages_set & gt_pages
+                precision = len(relevant_retrieved) / len(retrieved_pages_set) if retrieved_pages_set else 0.0
+                recall    = len(relevant_retrieved) / len(gt_pages) if gt_pages else 0.0
+                precisions.append(precision)
+                recalls.append(recall)
+
+                rr = 0.0
+                for rank, p in enumerate(retrieved_pages_list, start=1):
+                    if p in gt_pages:
+                        rr = 1.0 / rank
+                        break
+                rr_scores.append(rr)
+    except Exception as e:
+        err_str = str(e)
+        if "rate_limit" in err_str.lower() or "429" in err_str or "quota" in err_str.lower():
+            quota_hit = True
+            st.warning(
+                f"Hit Gemini's daily quota after generating {len(sims)} answer(s) — "
+                "this still happens here because generating the answers themselves "
+                "needs the main chat model, the same one your regular testing uses. "
+                "What this page DOES avoid is the 200+ extra judge calls RAGAS "
+                "makes on top of that, which is what drains quota fastest."
+            )
+            with st.expander("Technical details"):
+                st.code(err_str)
+        else:
+            st.error(f"Answer generation failed: {err_str}")
+            st.stop()
+
+    prog.empty()
+
+    if quota_hit and not sims:
+        st.stop()
+
+    if not sims:
+        st.error("No ground truth filled in yet — fill in at least one reference answer above.")
+        st.stop()
+
+    avg_sim  = round(float(np.mean(sims)) * 100, 1)
+    avg_prec = round(float(np.mean(precisions)) * 100, 1) if precisions else None
+    avg_rec  = round(float(np.mean(recalls)) * 100, 1) if recalls else None
+    avg_mrr  = round(float(np.mean(rr_scores)) * 100, 1) if rr_scores else None
+
+    parts = [v for v in (avg_sim, avg_prec, avg_rec, avg_mrr) if v is not None]
+    overall = round(sum(parts) / len(parts), 1)
+
+    save_local_result(
+        exp_id, chunk_size, top_k, avg_sim, avg_prec, avg_rec, avg_mrr,
+        overall, len(sims)
+    )
+
+    st.session_state.local_latest = {
+        "experiment":          exp_id,
+        "chunk_size":          chunk_size,
+        "top_k":               top_k,
+        "semantic_similarity": avg_sim,
+        "retrieval_precision": avg_prec,
+        "retrieval_recall":    avg_rec,
+        "mrr":                 avg_mrr,
+        "overall":             overall,
+        "num_questions":       len(sims),
+    }
+    st.rerun()
+
+# ── Section 3: latest run — terminal panel ─────────────────────────────────────
+if "local_latest" in st.session_state:
+    r = st.session_state.local_latest
+
+    def _fmt(v):
+        return f"{v}%" if v is not None else "—"
+
+    st.markdown('<div class="sec">3. Latest result</div>', unsafe_allow_html=True)
+
+    st.markdown(f"""
+    <div class="score-box">
+        <div class="score-title">READDOC AI — LOCAL METRICS [{r['experiment']}]</div>
+        <div class="score-row">
+            <span class="score-label">Semantic similarity</span>
+            <span class="score-val">{_fmt(r['semantic_similarity'])}</span>
+        </div>
+        <div class="score-row">
+            <span class="score-label">Retrieval precision</span>
+            <span class="score-val">{_fmt(r['retrieval_precision'])}</span>
+        </div>
+        <div class="score-row">
+            <span class="score-label">Retrieval recall</span>
+            <span class="score-val">{_fmt(r['retrieval_recall'])}</span>
+        </div>
+        <div class="score-row">
+            <span class="score-label">MRR</span>
+            <span class="score-val">{_fmt(r['mrr'])}</span>
+        </div>
+        <div class="score-divider"></div>
+        <div class="score-row">
+            <span class="score-label">Overall</span>
+            <span class="score-overall">{_fmt(r['overall'])}</span>
+        </div>
+        <div class="score-divider"></div>
+        <div class="score-row">
+            <span class="score-label">Chunk {r['chunk_size']} chars · k={r['top_k']} · {r['num_questions']} questions scored</span>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown('<div class="metric-compare">', unsafe_allow_html=True)
+    for label, val in [
+        ("Semantic similarity", r["semantic_similarity"]),
+        ("Retrieval precision", r["retrieval_precision"]),
+        ("Retrieval recall", r["retrieval_recall"]),
+    ]:
+        if val is None:
+            colour, display = "#9CA3AF", "—"
+        else:
+            colour  = "#059669" if val >= 80 else "#C2410C" if val < 60 else "#1a56db"
+            display = f"{val}%"
+        st.markdown(
+            f'<div class="mc"><div class="mc-val" style="color:{colour}">{display}</div>'
+            f'<div class="mc-label">{label}</div></div>',
+            unsafe_allow_html=True,
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ── Section 4: results across all experiments ──────────────────────────────────
+st.markdown('<div class="sec">4. Local metrics across all experiments</div>',
+            unsafe_allow_html=True)
+
+df_local = load_local_results()
+
+if df_local.empty:
+    st.markdown("""
+    <div class="empty-box">
+        <b style="color:#374151;font-size:15px">No saved results yet</b><br><br>
+        Run local metrics for at least one experiment above — every run is
+        saved automatically, and this section fills in with comparison
+        charts once you have two or more.
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    st.markdown("**Full results table**")
+    display_df = df_local[[
+        "experiment", "chunk_size", "top_k",
+        "semantic_similarity", "retrieval_precision", "retrieval_recall", "mrr",
+        "overall", "num_questions"
+    ]].rename(columns={
+        "experiment":          "Experiment",
+        "chunk_size":          "Chunk size",
+        "top_k":               "k",
+        "semantic_similarity": "Semantic similarity",
+        "retrieval_precision": "Precision",
+        "retrieval_recall":    "Recall",
+        "mrr":                 "MRR",
+        "overall":             "Overall",
+        "num_questions":       "Questions",
+    })
+    st.dataframe(
+        display_df, hide_index=True, use_container_width=True,
+        column_config={
+            "Semantic similarity": st.column_config.ProgressColumn("Semantic similarity", min_value=0, max_value=100, format="%.1f%%"),
+            "Precision":           st.column_config.ProgressColumn("Precision", min_value=0, max_value=100, format="%.1f%%"),
+            "Recall":              st.column_config.ProgressColumn("Recall", min_value=0, max_value=100, format="%.1f%%"),
+            "MRR":                 st.column_config.ProgressColumn("MRR", min_value=0, max_value=100, format="%.1f%%"),
+            "Overall":             st.column_config.ProgressColumn("Overall", min_value=0, max_value=100, format="%.1f%%"),
+        }
+    )
+
+    valid_df = df_local.dropna(subset=["overall"])
+
+    if not valid_df.empty:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("**Overall local score per experiment**")
+            chart_df = valid_df.set_index("experiment")["overall"].rename("Overall score")
+            st.bar_chart(chart_df, color="#059669", height=280)
+
+        with col2:
+            st.markdown("**All four metrics, side by side**")
+            metrics_df = valid_df.set_index("experiment")[
+                ["semantic_similarity", "retrieval_precision", "retrieval_recall", "mrr"]
+            ]
+            metrics_df.columns = ["Semantic similarity", "Precision", "Recall", "MRR"]
+            st.bar_chart(metrics_df, height=280)
+
+        if len(valid_df) >= 2:
+            st.markdown("**Chunk size vs average local score**")
+            chunk_avg = valid_df.groupby("chunk_size")["overall"].mean().reset_index()
+            chunk_avg["chunk_size"] = chunk_avg["chunk_size"].astype(str) + " chars"
+            st.bar_chart(chunk_avg.set_index("chunk_size")["overall"], color="#1D9E75", height=240)
+
+        best_row = valid_df.loc[valid_df["overall"].idxmax()]
+        st.markdown(f"""
+        <div class="info-box">
+            Best configuration so far: <b>{best_row['experiment']}</b>
+            (chunk {int(best_row['chunk_size'])}, k={int(best_row['top_k'])})
+            with an overall local score of <b>{best_row['overall']}%</b>.
+            Evaluated {len(valid_df)} of 9 experiment configurations.
+        </div>
+        """, unsafe_allow_html=True)
+
+    csv = df_local.to_csv(index=False)
+    st.download_button(
+        "Download all local metrics results (CSV)",
+        data=csv,
+        file_name="local_metrics_all_experiments.csv",
+        mime="text/csv",
+        use_container_width=False,
+    )
+    st.caption("Include this alongside your manual scores and RAGAS results in the dissertation appendix.")
+
+# ── Methodology note ────────────────────────────────────────────────────────────
+st.markdown('<div class="sec">How these scores are calculated</div>', unsafe_allow_html=True)
+st.markdown("""
+<div class="info-box">
+    <b>Semantic similarity</b> — cosine similarity between the embedding of
+    the generated answer and the embedding of a short reference answer,
+    using the same all-MiniLM-L6-v2 model already used for retrieval. For
+    out-of-scope questions, the reference is the ideal refusal text, so a
+    system that correctly declines to answer scores well here too.<br><br>
+    <b>Retrieval precision</b> — of the k chunks retrieved, what fraction
+    came from a page actually containing the answer.<br><br>
+    <b>Retrieval recall</b> — of all the correct page(s), what fraction
+    were retrieved at all.<br><br>
+    <b>MRR (Mean Reciprocal Rank)</b> — how high up the retrieved list the
+    first correct page appeared. A correct page retrieved first scores 1.0;
+    second position scores 0.5; not retrieved at all scores 0.<br><br>
+    None of these four metrics make an LLM API call — they're computed
+    entirely from the embedding model and the retrieval system's own
+    output, so they carry no rate-limit or quota risk and can be re-run
+    freely.
+</div>
+""", unsafe_allow_html=True)
