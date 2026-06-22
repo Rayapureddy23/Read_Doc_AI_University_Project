@@ -1,6 +1,6 @@
 """
 9_Local_Metrics.py — Zero-Cost Automated Evaluation
-
+=====================================================
 
 Two automated evaluation methods that use NO LLM API calls at all beyond
 generating the answers themselves (which the experiment needs regardless).
@@ -26,7 +26,7 @@ numbers) — saved to the database so you never need to re-enter it.
 """
 
 import streamlit as st
-import sys, os, sqlite3
+import sys, os, sqlite3, time
 import pandas as pd
 import numpy as np
 
@@ -328,6 +328,7 @@ if st.button(f"Run local metrics for {exp_id}", type="primary", use_container_wi
 
             chunks = rag.search(q["q"], top_k=top_k)
             answer = ask_llama(q["q"], chunks, [])
+            time.sleep(4)  # stay under Gemini free tier's 15 RPM cap
 
             # --- Semantic similarity (all questions with a reference answer) ---
             emb_pair = model.encode([answer, ref_answer])
