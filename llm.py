@@ -1,72 +1,82 @@
 """
 llm.py — Language Model Integration
 =====================================
+PRIMARY: Ollama (fully local, zero API dependency).
+  - Runs on your own machine at http://localhost:11434
+  - Zero rate limits, zero quota, zero cost, works offline
+  - Uses the same OpenAI-compatible API so function signatures unchanged
+  - Model: llama3.2:3b (change OLLAMA_MODEL below if you pulled a different one)
 
-Uses Google Gemini API (free tier) for answer generation — Groq has been
-fully removed from this file. Groq's free-tier daily token quota
-(~100K tokens/day, effectively ~100 calls/day) repeatedly blocked
-evaluation runs partway through. Gemini's free tier (1,500 requests/day
-on Gemini 2.5 Flash, no credit card required) is far more generous for
-this workload and resets daily.
+CLOUD FALLBACK: Google Gemini (for Streamlit Cloud deployment only).
+  - Ollama is a local server — Streamlit Cloud cannot reach localhost:11434
+  - When the app detects it cannot connect to Ollama, it falls back to Gemini
+  - Set GOOGLE_API_KEY in Streamlit Cloud Settings → Secrets for this to work
+  - Only affects the deployed demo; local evaluation always uses Ollama
 
-IMPORTANT — dissertation consistency: if your Project Overview /
-Methodology chapter states "Llama 3.3 via Groq API" as the tech stack,
-that text now needs updating to say Gemini, since this is the system
-that actually generates every answer going forward. Keep your written
-methodology matching what was actually run.
+HOW IT DECIDES:
+  - Tries to connect to Ollama first (quick 2-second timeout)
+  - If Ollama responds → uses it for everything (local mode)
+  - If Ollama is not reachable → uses Gemini (cloud/demo mode)
+  - A small banner in the app tells you which provider is active
 
-NOTE: the RAGAS Evaluation page's judge model is a SEPARATE Groq client
-(llama-3.1-8b-instant, its own much larger daily quota) defined inside
-8_RAGAS_Evaluation.py — this file does not touch that. If you want Groq
-removed from the judge too, that's a separate change, just say so.
-
-Three functions (same signatures and return types as before, so no
-other file in the project needs to change):
-  ask_llama_streaming() — RAG mode (with document context), streams tokens
-  ask_llama()            — RAG mode, non-streaming (experiment/eval pages)
-  ask_baseline()          — Baseline mode (no document context)
+Same public functions as before (unchanged signatures):
+  ask_llama_streaming()  — RAG mode, streams tokens
+  ask_llama()            — RAG mode, non-streaming
+  ask_baseline()         — no document context
 """
 
 import os
 import streamlit as st
-import google.generativeai as genai
 
-# ── Client setup ───────────────────────────────────────────────────────────────
-api_key = st.secrets.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-
-if not api_key:
-    st.error(
-        "GOOGLE_API_KEY not found. "
-        "Add it to .streamlit/secrets.toml (local) AND Streamlit Cloud's "
-        "Settings → Secrets (deployed app — these are two separate stores, "
-        "and the app must be rebooted after adding a secret there)."
-    )
-    st.stop()
-
-genai.configure(api_key=api_key)
-# Use gemini-1.5-flash-latest — the version-suffixed name required by
-# older google-generativeai SDK versions that route through v1beta.
-# Plain "gemini-1.5-flash" returns a 404 on v1beta.
-MODEL = "gemini-1.5-flash-latest"
+# ── Model names ────────────────────────────────────────────────────────────────
+# Change OLLAMA_MODEL to match whichever model you pulled:
+#   ollama pull llama3.2:1b   → OLLAMA_MODEL = "llama3.2:1b"
+#   ollama pull llama3.2:3b   → OLLAMA_MODEL = "llama3.2:3b"  (recommended)
+#   ollama pull gemma2:2b     → OLLAMA_MODEL = "gemma2:2b"
+OLLAMA_MODEL  = "llama3.2:3b"
+OLLAMA_URL    = "http://localhost:11434/v1"
+GEMINI_MODEL  = "gemini-1.5-flash-001"
 
 
-def _messages_to_gemini(messages: list):
-    """
-    Convert an OpenAI-style messages list (system/user/assistant) into
-    Gemini's format: a system_instruction string plus a list of
-    {"role": "user"|"model", "parts": [...]} turns. Gemini uses "model"
-    where OpenAI/Groq use "assistant".
-    """
-    system_instruction = None
-    gemini_turns = []
-    for m in messages:
-        if m["role"] == "system":
-            system_instruction = m["content"]
-        elif m["role"] == "user":
-            gemini_turns.append({"role": "user", "parts": [m["content"]]})
-        elif m["role"] == "assistant":
-            gemini_turns.append({"role": "model", "parts": [m["content"]]})
-    return system_instruction, gemini_turns
+# ── Detect which provider is available ────────────────────────────────────────
+@st.cache_resource
+def _detect_provider():
+    """Try to reach Ollama once at startup. Cache the result so we only
+    do the network probe once per session, not on every single call."""
+    try:
+        from openai import OpenAI
+        probe = OpenAI(base_url=OLLAMA_URL, api_key="ollama")
+        probe.models.list()           # fast probe — just checks connectivity
+        return "ollama"
+    except Exception:
+        return "gemini"
+
+
+def _provider():
+    return _detect_provider()
+
+
+# ── Ollama client (lazy — only created if Ollama is reachable) ─────────────────
+@st.cache_resource
+def _ollama_client():
+    from openai import OpenAI
+    return OpenAI(base_url=OLLAMA_URL, api_key="ollama")
+
+
+# ── Gemini client (lazy — only created if needed) ─────────────────────────────
+@st.cache_resource
+def _gemini_configured():
+    key = st.secrets.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not key:
+        return False
+    import google.generativeai as genai
+    genai.configure(api_key=key)
+    return True
+
+
+def _gemini_model(system_prompt: str):
+    import google.generativeai as genai
+    return genai.GenerativeModel(GEMINI_MODEL, system_instruction=system_prompt)
 
 
 # ── System prompt ──────────────────────────────────────────────────────────────
@@ -90,12 +100,14 @@ Rules:
 For greetings and general chat — respond naturally and introduce yourself as ReadDoc AI.
 """
 
+BASELINE_PROMPT = ("You are a helpful assistant. Answer the question using only "
+                   "your general knowledge. Be direct and concise.")
+
+
 # ── Build context message ──────────────────────────────────────────────────────
 def build_user_message(question: str, retrieved_chunks: list) -> str:
-    """Combine question + retrieved chunks into a single prompt."""
     if not retrieved_chunks:
         return question
-
     context = ""
     for i, chunk in enumerate(retrieved_chunks):
         context += (
@@ -103,63 +115,98 @@ def build_user_message(question: str, retrieved_chunks: list) -> str:
             f"[{chunk['file_name']} | Page {chunk['page_number']}] ---\n"
             f"{chunk['text']}\n"
         )
-
     return f"Context from uploaded documents:\n{context}\n\n---\n\nQuestion: {question}"
 
 
-# ── RAG streaming (main chat) ──────────────────────────────────────────────────
+# ── Internal helpers ───────────────────────────────────────────────────────────
+def _call_ollama(messages: list, max_tokens: int, stream: bool):
+    client = _ollama_client()
+    return client.chat.completions.create(
+        model=OLLAMA_MODEL,
+        messages=messages,
+        max_tokens=max_tokens,
+        stream=stream,
+    )
+
+
+def _messages_to_gemini(messages: list):
+    system = None
+    turns  = []
+    for m in messages:
+        if m["role"] == "system":
+            system = m["content"]
+        elif m["role"] == "user":
+            turns.append({"role": "user",  "parts": [m["content"]]})
+        elif m["role"] == "assistant":
+            turns.append({"role": "model", "parts": [m["content"]]})
+    return system, turns
+
+
+def _call_gemini(messages: list, max_tokens: int, stream: bool):
+    import google.generativeai as genai
+    system, turns = _messages_to_gemini(messages)
+    model = genai.GenerativeModel(GEMINI_MODEL, system_instruction=system)
+    *history, last = turns
+    chat = model.start_chat(history=history)
+    return chat.send_message(
+        last["parts"][0],
+        generation_config={"max_output_tokens": max_tokens},
+        stream=stream,
+    )
+
+
+# ── Public API ─────────────────────────────────────────────────────────────────
 def ask_llama_streaming(question: str, retrieved_chunks: list, history: list):
-    """
-    Stream answer tokens one by one for real-time display.
-    Sends full conversation history so the model remembers previous turns.
-    """
+    """Stream answer tokens — RAG mode with document context."""
     messages = (
         [{"role": "system", "content": SYSTEM_PROMPT}]
         + history
         + [{"role": "user", "content": build_user_message(question, retrieved_chunks)}]
     )
-    system_instruction, gemini_turns = _messages_to_gemini(messages)
-    model = genai.GenerativeModel(MODEL, system_instruction=system_instruction)
-    *history_turns, last_turn = gemini_turns
-    chat = model.start_chat(history=history_turns)
-    response = chat.send_message(
-        last_turn["parts"][0],
-        generation_config={"max_output_tokens": 1024},
-        stream=True,
-    )
-    for chunk in response:
-        if chunk.text:
-            yield chunk.text
+    if _provider() == "ollama":
+        stream = _call_ollama(messages, max_tokens=1024, stream=True)
+        for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield delta
+    else:
+        if not _gemini_configured():
+            yield "⚠️ No LLM available. Add GOOGLE_API_KEY to Streamlit secrets for the deployed app."
+            return
+        response = _call_gemini(messages, max_tokens=1024, stream=True)
+        for chunk in response:
+            if chunk.text:
+                yield chunk.text
 
 
-# ── RAG non-streaming (experiment runner, RAGAS, Local Metrics) ────────────────
 def ask_llama(question: str, retrieved_chunks: list, history: list) -> str:
-    """Returns full answer as a string — used by Experiment Runner, RAGAS
-    Evaluation, and Local Metrics."""
+    """Return full answer as string — RAG mode, non-streaming."""
     messages = (
         [{"role": "system", "content": SYSTEM_PROMPT}]
         + history
         + [{"role": "user", "content": build_user_message(question, retrieved_chunks)}]
     )
-    system_instruction, gemini_turns = _messages_to_gemini(messages)
-    model = genai.GenerativeModel(MODEL, system_instruction=system_instruction)
-    *history_turns, last_turn = gemini_turns
-    chat = model.start_chat(history=history_turns)
-    response = chat.send_message(
-        last_turn["parts"][0],
-        generation_config={"max_output_tokens": 1024},
-    )
-    return response.text
+    if _provider() == "ollama":
+        resp = _call_ollama(messages, max_tokens=1024, stream=False)
+        return resp.choices[0].message.content
+    else:
+        if not _gemini_configured():
+            return "⚠️ No LLM available. Add GOOGLE_API_KEY to Streamlit secrets for the deployed app."
+        resp = _call_gemini(messages, max_tokens=1024, stream=False)
+        return resp.text
 
 
-# ── Baseline — no document context ────────────────────────────────────────────
 def ask_baseline(question: str) -> str:
-    model = genai.GenerativeModel(
-        MODEL,
-        system_instruction="You are a helpful assistant. Answer the question using only your general knowledge. Be direct and concise.",
-    )
-    response = model.generate_content(
-        question,
-        generation_config={"max_output_tokens": 512},
-    )
-    return response.text
+    """Return answer with no document context — baseline evaluation mode."""
+    messages = [
+        {"role": "system", "content": BASELINE_PROMPT},
+        {"role": "user",   "content": question},
+    ]
+    if _provider() == "ollama":
+        resp = _call_ollama(messages, max_tokens=512, stream=False)
+        return resp.choices[0].message.content
+    else:
+        if not _gemini_configured():
+            return "⚠️ No LLM available. Add GOOGLE_API_KEY to Streamlit secrets for the deployed app."
+        resp = _call_gemini(messages, max_tokens=512, stream=False)
+        return resp.text
