@@ -44,11 +44,10 @@ if not api_key:
     st.stop()
 
 genai.configure(api_key=api_key)
-# gemini-2.5-flash is capped at only 5 RPM on the free tier — too low
-# for a 20-question evaluation run. gemini-1.5-flash has a 15 RPM
-# free-tier limit, which (combined with 5s delays between calls) keeps
-# throughput at ~12 RPM and never hits the cap.
-MODEL = "gemini-1.5-flash"
+# Use gemini-1.5-flash-latest — the version-suffixed name required by
+# older google-generativeai SDK versions that route through v1beta.
+# Plain "gemini-1.5-flash" returns a 404 on v1beta.
+MODEL = "gemini-1.5-flash-latest"
 
 
 def _messages_to_gemini(messages: list):

@@ -311,7 +311,7 @@ if st.button(f"Run local metrics for {exp_id}", type="primary", use_container_wi
 
     model = rag.get_embedding_model()
 
-    sims, precisions, recalls, rr_scores = [], [], [], []
+    sims, precisions, recalls, rr_scores, faithfulness_scores = [], [], [], [], []
     prog = st.progress(0, text="Generating answers and scoring...")
 
     quota_hit = False
@@ -328,13 +328,29 @@ if st.button(f"Run local metrics for {exp_id}", type="primary", use_container_wi
 
             chunks = rag.search(q["q"], top_k=top_k)
             answer = ask_llama(q["q"], chunks, [])
-            time.sleep(5)  # 12 RPM — safely under gemini-1.5-flash's 15 RPM free-tier cap
+            time.sleep(5)  # 12 RPM — safely under gemini-1.5-flash's 15 RPM cap
 
             # --- Semantic similarity (all questions with a reference answer) ---
             emb_pair = model.encode([answer, ref_answer])
             a_vec, r_vec = emb_pair[0], emb_pair[1]
             cos_sim = float(np.dot(a_vec, r_vec) / (np.linalg.norm(a_vec) * np.linalg.norm(r_vec)))
             sims.append(max(0.0, cos_sim))
+
+            # --- Local faithfulness (zero API calls) ---
+            # Measures whether the answer is grounded in the retrieved context
+            # by computing cosine similarity between the answer embedding and
+            # the average embedding of the retrieved chunks. A faithful answer
+            # stays semantically close to the context; a hallucinated one drifts
+            # away from it. This is a local proxy for RAGAS Faithfulness that
+            # requires no LLM judge call at all.
+            if chunks:
+                context_texts = [c["text"] for c in chunks]
+                context_vecs  = model.encode(context_texts)
+                context_mean  = context_vecs.mean(axis=0)
+                faith_sim     = float(np.dot(a_vec, context_mean) / (
+                    np.linalg.norm(a_vec) * np.linalg.norm(context_mean)
+                ))
+                faithfulness_scores.append(max(0.0, faith_sim))
 
             # --- Retrieval precision / recall / MRR (in-scope questions only) ---
             if gt_pages_raw:
@@ -380,12 +396,13 @@ if st.button(f"Run local metrics for {exp_id}", type="primary", use_container_wi
         st.error("No ground truth filled in yet — fill in at least one reference answer above.")
         st.stop()
 
-    avg_sim  = round(float(np.mean(sims)) * 100, 1)
-    avg_prec = round(float(np.mean(precisions)) * 100, 1) if precisions else None
-    avg_rec  = round(float(np.mean(recalls)) * 100, 1) if recalls else None
-    avg_mrr  = round(float(np.mean(rr_scores)) * 100, 1) if rr_scores else None
+    avg_sim   = round(float(np.mean(sims)) * 100, 1)
+    avg_faith = round(float(np.mean(faithfulness_scores)) * 100, 1) if faithfulness_scores else None
+    avg_prec  = round(float(np.mean(precisions)) * 100, 1) if precisions else None
+    avg_rec   = round(float(np.mean(recalls)) * 100, 1) if recalls else None
+    avg_mrr   = round(float(np.mean(rr_scores)) * 100, 1) if rr_scores else None
 
-    parts = [v for v in (avg_sim, avg_prec, avg_rec, avg_mrr) if v is not None]
+    parts   = [v for v in (avg_sim, avg_faith, avg_prec, avg_rec, avg_mrr) if v is not None]
     overall = round(sum(parts) / len(parts), 1)
 
     save_local_result(
@@ -398,6 +415,7 @@ if st.button(f"Run local metrics for {exp_id}", type="primary", use_container_wi
         "chunk_size":          chunk_size,
         "top_k":               top_k,
         "semantic_similarity": avg_sim,
+        "local_faithfulness":  avg_faith,
         "retrieval_precision": avg_prec,
         "retrieval_recall":    avg_rec,
         "mrr":                 avg_mrr,
@@ -421,6 +439,10 @@ if "local_latest" in st.session_state:
         <div class="score-row">
             <span class="score-label">Semantic similarity</span>
             <span class="score-val">{_fmt(r['semantic_similarity'])}</span>
+        </div>
+        <div class="score-row">
+            <span class="score-label">Local faithfulness</span>
+            <span class="score-val">{_fmt(r.get('local_faithfulness'))}</span>
         </div>
         <div class="score-row">
             <span class="score-label">Retrieval precision</span>
@@ -559,6 +581,12 @@ st.markdown("""
     using the same all-MiniLM-L6-v2 model already used for retrieval. For
     out-of-scope questions, the reference is the ideal refusal text, so a
     system that correctly declines to answer scores well here too.<br><br>
+    <b>Local faithfulness</b> — cosine similarity between the generated
+    answer embedding and the mean embedding of all retrieved context chunks.
+    A faithful answer stays semantically close to the context it was derived
+    from; a hallucinated answer drifts away from it. This is a fully local
+    proxy for RAGAS Faithfulness that requires no LLM judge call whatsoever —
+    computed entirely with the same embedding model used for retrieval.<br><br>
     <b>Retrieval precision</b> — of the k chunks retrieved, what fraction
     came from a page actually containing the answer.<br><br>
     <b>Retrieval recall</b> — of all the correct page(s), what fraction
@@ -566,9 +594,9 @@ st.markdown("""
     <b>MRR (Mean Reciprocal Rank)</b> — how high up the retrieved list the
     first correct page appeared. A correct page retrieved first scores 1.0;
     second position scores 0.5; not retrieved at all scores 0.<br><br>
-    None of these four metrics make an LLM API call — they're computed
-    entirely from the embedding model and the retrieval system's own
-    output, so they carry no rate-limit or quota risk and can be re-run
-    freely.
+    <b>None of these five metrics make an LLM API call</b> — they are all
+    computed from the embedding model and retrieval system output alone,
+    carrying zero rate-limit or quota risk and runnable as many times a
+    day as needed.
 </div>
 """, unsafe_allow_html=True)

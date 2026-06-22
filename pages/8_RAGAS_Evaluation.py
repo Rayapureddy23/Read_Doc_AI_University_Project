@@ -2,6 +2,7 @@
 8_RAGAS_Evaluation.py — Automated RAG Evaluation using RAGAS
 ==============================================================
 
+
 Runs RAGAS scoring for a chosen experiment configuration (E1-E9), saves
 the result to the shared experiments database, displays a terminal-style
 score panel for the latest run, and plots comparison charts across every
@@ -111,7 +112,7 @@ try:
     class _GeminiLLM(LLM):
         """Minimal LangChain-compatible LLM wrapper around the Gemini
         SDK, used as the RAGAS judge."""
-        model: str = "gemini-1.5-flash"
+        model: str = "gemini-1.5-flash-latest"
 
         @property
         def _llm_type(self) -> str:
