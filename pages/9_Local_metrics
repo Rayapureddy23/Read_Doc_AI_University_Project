@@ -328,7 +328,7 @@ if st.button(f"Run local metrics for {exp_id}", type="primary", use_container_wi
 
             chunks = rag.search(q["q"], top_k=top_k)
             answer = ask_llama(q["q"], chunks, [])
-            time.sleep(4)  # stay under Gemini free tier's 15 RPM cap
+            time.sleep(5)  # 12 RPM — safely under gemini-1.5-flash's 15 RPM free-tier cap
 
             # --- Semantic similarity (all questions with a reference answer) ---
             emb_pair = model.encode([answer, ref_answer])

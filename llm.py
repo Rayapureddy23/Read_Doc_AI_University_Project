@@ -1,6 +1,7 @@
 """
 llm.py — Language Model Integration
 =====================================
+
 Uses Google Gemini API (free tier) for answer generation — Groq has been
 fully removed from this file. Groq's free-tier daily token quota
 (~100K tokens/day, effectively ~100 calls/day) repeatedly blocked
@@ -43,7 +44,11 @@ if not api_key:
     st.stop()
 
 genai.configure(api_key=api_key)
-MODEL = "gemini-2.5-flash"
+# gemini-2.5-flash is capped at only 5 RPM on the free tier — too low
+# for a 20-question evaluation run. gemini-1.5-flash has a 15 RPM
+# free-tier limit, which (combined with 5s delays between calls) keeps
+# throughput at ~12 RPM and never hits the cap.
+MODEL = "gemini-1.5-flash"
 
 
 def _messages_to_gemini(messages: list):

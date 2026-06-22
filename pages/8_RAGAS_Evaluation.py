@@ -1,6 +1,7 @@
 """
 8_RAGAS_Evaluation.py — Automated RAG Evaluation using RAGAS
 ==============================================================
+
 Runs RAGAS scoring for a chosen experiment configuration (E1-E9), saves
 the result to the shared experiments database, displays a terminal-style
 score panel for the latest run, and plots comparison charts across every
@@ -8,7 +9,7 @@ experiment evaluated so far.
 """
 
 import streamlit as st
-import sys, os, sqlite3
+import sys, os, sqlite3, time
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -110,7 +111,7 @@ try:
     class _GeminiLLM(LLM):
         """Minimal LangChain-compatible LLM wrapper around the Gemini
         SDK, used as the RAGAS judge."""
-        model: str = "gemini-2.5-flash"
+        model: str = "gemini-1.5-flash"
 
         @property
         def _llm_type(self) -> str:
@@ -386,6 +387,10 @@ if st.button(f"Run RAGAS for {exp_id}", type="primary", use_container_width=True
             data["answer"].append(answer)
             data["contexts"].append(contexts)
             data["ground_truth"].append("")
+            # 5s pause keeps calls at ~12 RPM — safely under gemini-1.5-flash
+            # free tier's 15 RPM cap. gemini-2.5-flash has only 5 RPM which
+            # is why it kept failing at question 5 or 6.
+            time.sleep(5)
     except Exception as e:
         prog.empty()
         err_str = str(e)
