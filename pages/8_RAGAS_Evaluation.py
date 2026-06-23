@@ -2,7 +2,6 @@
 8_RAGAS_Evaluation.py — Automated RAG Evaluation using RAGAS
 ==============================================================
 
-
 Runs RAGAS scoring for a chosen experiment configuration (E1-E9), saves
 the result to the shared experiments database, displays a terminal-style
 score panel for the latest run, and plots comparison charts across every
@@ -84,55 +83,66 @@ if not RAGAS_AVAILABLE:
     st.code("pip install ragas datasets", language="bash")
     st.stop()
 
-# ── RAGAS judge setup — uses Gemini instead of OpenAI (which RAGAS
-# defaults to and which this project has no key for). Groq has been
-# fully removed from this project after repeated daily-quota walls.
+# ── RAGAS judge setup — uses Ollama (fully local) instead of Gemini/OpenAI.
+# This makes the entire RAGAS evaluation pipeline API-free when running
+# locally. Ollama runs at http://localhost:11434 and exposes an
+# OpenAI-compatible API — we talk to it directly via the openai SDK,
+# wrapped in a tiny custom LangChain LLM class that ragas.evaluate()
+# accepts natively. No external API, no rate limits, no quota, forever.
 #
-# Same approach as before: a small custom class implementing LangChain's
-# plain LLM interface, talking to Gemini's SDK directly, rather than
-# pulling in the langchain-google-genai package — that package tracks
-# the same fast-moving langchain-core releases that made langchain_groq
-# unusable alongside ragas==0.1.21 (which pins langchain-core<0.3), so
-# the same direct-SDK-wrapper approach avoids that whole class of
-# dependency conflict again.
-GEMINI_JUDGE_AVAILABLE = True
+# The same langchain-core conflict rule still applies: we cannot use
+# langchain_groq or langchain_google_genai because both require
+# langchain-core>=0.3 while ragas==0.1.21 pins langchain-core<0.3.
+# Wrapping the openai SDK directly (which already ships with this project
+# for the Ollama integration in llm.py) sidesteps that entirely.
+GEMINI_JUDGE_AVAILABLE = True   # kept as variable name for compatibility
 gemini_judge_error = None
+OLLAMA_JUDGE_MODEL = "llama3.2:3b"   # change to match your ollama list output
+OLLAMA_JUDGE_URL   = "http://localhost:11434/v1"
+
 try:
     from ragas.llms import LangchainLLMWrapper
     from ragas.embeddings import LangchainEmbeddingsWrapper
     from langchain_core.language_models.llms import LLM
-    import google.generativeai as genai
+    from openai import OpenAI as _OpenAIClient
     from typing import Optional, List, Any
     import time
 
-    _GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY") or os.environ.get("GOOGLE_API_KEY")
-    if _GOOGLE_API_KEY:
-        genai.configure(api_key=_GOOGLE_API_KEY)
+    class _OllamaLLM(LLM):
+        """Minimal LangChain-compatible LLM wrapper around Ollama's
+        OpenAI-compatible local API, used as the RAGAS judge.
 
-    class _GeminiLLM(LLM):
-        """Minimal LangChain-compatible LLM wrapper around the Gemini
-        SDK, used as the RAGAS judge."""
-        model: str = "gemini-1.5-flash-latest"
+        Zero external API calls — runs entirely on your machine.
+        No rate limits, no quota, no key required.
+
+        run_manager must be in the signature: LangChain's LLM base
+        class calls _call(prompt, stop, run_manager) positionally and
+        crashes with 'takes from 2 to 3 positional arguments but 4
+        were given' if run_manager is absent (learned the hard way with
+        earlier Groq and Gemini wrappers).
+        """
+        model:    str = OLLAMA_JUDGE_MODEL
+        base_url: str = OLLAMA_JUDGE_URL
 
         @property
         def _llm_type(self) -> str:
-            return "gemini-custom"
+            return "ollama-local"
 
         def _call(self, prompt: str, stop: Optional[List[str]] = None,
                   run_manager: Optional[Any] = None, **kwargs: Any) -> str:
-            # LangChain's LLM base class calls _call(prompt, stop, run_manager)
-            # positionally — this signature must include run_manager or it
-            # crashes on every single invocation (learned the hard way with
-            # the previous Groq wrapper).
+            client     = _OpenAIClient(base_url=self.base_url, api_key="ollama")
             last_error = None
             for attempt in range(3):
                 try:
-                    gemini_model = genai.GenerativeModel(self.model)
-                    response = gemini_model.generate_content(prompt)
-                    return response.text
+                    resp = client.chat.completions.create(
+                        model=self.model,
+                        messages=[{"role": "user", "content": prompt}],
+                        max_tokens=1024,
+                    )
+                    return resp.choices[0].message.content
                 except Exception as e:
                     last_error = e
-                    time.sleep(2 ** attempt)  # 1s, 2s, 4s backoff
+                    time.sleep(1)
             raise last_error
 
     class _LocalEmbeddings:
@@ -145,19 +155,16 @@ try:
             return rag.get_embedding_model().encode([text])[0].tolist()
 
     def get_ragas_judge():
-        judge_llm        = LangchainLLMWrapper(_GeminiLLM())
+        judge_llm        = LangchainLLMWrapper(_OllamaLLM())
         judge_embeddings = LangchainEmbeddingsWrapper(_LocalEmbeddings())
         return judge_llm, judge_embeddings
 
     def test_gemini_judge():
-        """Pre-flight check — confirms the judge can actually reach
-        Gemini before burning a full 20-question RAGAS run on a broken
-        setup (e.g. a bad API key)."""
-        if not _GOOGLE_API_KEY:
-            return False, "GOOGLE_API_KEY not set in secrets"
+        """Pre-flight check — confirms the local Ollama judge responds
+        before burning a full 20-question RAGAS run on a broken setup."""
         try:
-            reply = _GeminiLLM()._call("Reply with exactly one word: OK")
-            return True, reply
+            reply = _OllamaLLM()._call("Reply with exactly one word: OK")
+            return True, reply.strip()
         except Exception as e:
             return False, str(e)
 
@@ -686,28 +693,26 @@ st.markdown('<div class="sec">LLM judge configuration</div>',
             unsafe_allow_html=True)
 
 if GEMINI_JUDGE_AVAILABLE:
-    st.markdown("""
+    st.markdown(f"""
     <div class="info-box">
-        This page scores answers using <b>Gemini 2.5 Flash</b> as the RAGAS
-        judge, and the same local <b>all-MiniLM-L6-v2</b> embedding model
-        used for retrieval — no OpenAI key required. Groq has been fully
-        removed from this project; Gemini's free tier (1,500 requests/day,
-        no credit card) is far more generous than Groq's daily quota was,
-        which is why evaluation runs kept stalling before this switch.
-        Gemini is called directly through a small custom LangChain-compatible
-        wrapper, avoiding any extra package that could conflict with
-        <code>ragas==0.1.21</code>'s pinned <code>langchain-core</code>
-        version. This is wired in automatically for every run above.
+        This page scores answers using <b>Ollama ({OLLAMA_JUDGE_MODEL})</b> as
+        the RAGAS judge — running fully locally on your machine with zero
+        external API calls, no rate limits, and no quota. The same local
+        <b>all-MiniLM-L6-v2</b> embedding model used for retrieval handles
+        the embedding similarity calculations. Both are wired in automatically
+        for every run above. If you change which model you have installed in
+        Ollama, update <code>OLLAMA_JUDGE_MODEL</code> near the top of this
+        file to match.
     </div>
     """, unsafe_allow_html=True)
 else:
     st.markdown(f"""
     <div class="info-box" style="background:#FFF7ED;border-color:#FED7AA;color:#92400E">
-        <b>Could not set up the Gemini judge</b> ({gemini_judge_error}).
-        RAGAS will fall back to its OpenAI default and fail without an
-        OpenAI key. Check that <code>GOOGLE_API_KEY</code> is set in both
-        your local <code>.streamlit/secrets.toml</code> and Streamlit
-        Cloud's Settings → Secrets (these are separate stores — the
-        deployed app needs its own copy, and a reboot after adding it).
+        <b>Could not set up the Ollama judge</b> ({gemini_judge_error}).<br>
+        Make sure Ollama is running (check your Windows system tray) and that
+        the <code>openai</code> Python package is installed:
+        <code>pip install openai</code>. Also confirm the model name in
+        <code>OLLAMA_JUDGE_MODEL</code> matches what <code>ollama list</code>
+        shows on your machine.
     </div>
     """, unsafe_allow_html=True)
