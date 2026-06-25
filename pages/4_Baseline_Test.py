@@ -99,7 +99,7 @@ init_db()
 existing  = load_scores()
 saved_ids = set(existing["question_id"].tolist()) if not existing.empty else set()
 
-if st.button("🚀 Generate all 10 answers", type="primary", use_container_width=True):
+if st.button("Generate all 10 answers", type="primary", use_container_width=True):
     prog = st.progress(0)
     for i, q in enumerate(QUESTIONS):
         prog.progress((i+1)/10, text=f"Generating Q{q['id']} of 10...")
@@ -137,7 +137,7 @@ for q in QUESTIONS:
             rel = st.selectbox("Relevance", [f"{v:.2f}" for v in SCORE_OPTIONS],
                 index=_idx(ex["relevance"]) if ex is not None else 2, key=f"b_rel_{q['id']}")
         with col3:
-            st.markdown('<div class="faith-badge">Faithfulness<br><b>0.00</b> (fixed)</div>', unsafe_allow_html=True)
+            st.selectbox("Faithfulness", [f"{v:.2f}" for v in SCORE_OPTIONS], disabled=True, key=f"b_faith_{q['id']}")
         with col4:
             st.markdown("<br>", unsafe_allow_html=True)
             if st.button("Save", key=f"b_save_{q['id']}", use_container_width=True):

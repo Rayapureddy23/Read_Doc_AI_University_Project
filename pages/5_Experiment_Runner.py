@@ -128,7 +128,7 @@ saved_ids = set(existing["question_id"].tolist()) if not existing.empty else set
 
 st.markdown("---")
 indexed_paths = st.session_state.get("indexed_file_paths")
-if st.button(f"🚀 Generate all 10 answers for {exp_id}", type="primary", use_container_width=True):
+if st.button(f" Generate all 10 answers for {exp_id}", type="primary", use_container_width=True):
     if indexed_paths and chunk_size not in st.session_state.get("prebuilt_sizes", set()):
         with st.spinner(f"Switching index to chunk size {chunk_size}..."):
             rag.build_index(indexed_paths, chunk_size=chunk_size)
