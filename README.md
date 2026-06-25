@@ -201,8 +201,7 @@ ReadDocumentAI/
 
 ## Author
 
-**Sebestian Rayapureddy**
-MSc Data Science and Analytics
-University Project — 2025/2026
+**Dharmendrakumar Reddy Rayapureddy**
+MSc Data Science Project — 2025/2026
 
 *ReadDoc AI is built as an empirical research platform for an MSc dissertation. The live app is available at [readdocai.streamlit.app](https://readdocai.streamlit.app).*
