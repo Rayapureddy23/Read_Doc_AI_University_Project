@@ -161,13 +161,13 @@ for q in QUESTIONS:
     """, unsafe_allow_html=True)
 
     if ans:
-        st.markdown('<div class="a-body"><div class="a-label">Answer</div><div class="a-text">', unsafe_allow_html=True)
+        st.markdown('<div class="a-label" style="font-size:11px;font-weight:600;color:#9CA3AF;text-transform:uppercase;letter-spacing:.06em;padding:16px 0 6px 0">Answer</div>', unsafe_allow_html=True)
         st.markdown(ans)
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("")
         if src:
             tags = "".join(f'<span class="src-tag">{s.strip()}</span>' for s in src.split("|") if s.strip())
             st.markdown(f'<div class="src-row"><span class="src-label">Sources</span>{tags}</div>', unsafe_allow_html=True)
-        st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("")
 
         col1, col2, col3, col4 = st.columns([2,2,2,1])
         with col1:
