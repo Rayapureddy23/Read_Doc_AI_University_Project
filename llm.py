@@ -1,16 +1,6 @@
 ﻿"""
 llm.py — Language Model Integration
 =====================================
-
-Uses Groq API with Llama 3.3 70B for answer generation.
-RAGAS has been dropped from the evaluation pipeline — Local Metrics
-covers all three RQ constructs (accuracy, contextual relevance,
-faithfulness) using only the 20 answer-generation calls per experiment,
-with zero additional judge calls.
-
-Token budget across all 9 experiments:
-  20 answers × 9 experiments × ~400 tokens = ~72,000 tokens total
-  Groq free limit: 100,000 tokens/day
   All 9 experiments fit in one day with headroom to spare.
 """
 
@@ -30,27 +20,6 @@ if not api_key:
 
 client = Groq(api_key=api_key)
 MODEL  = "llama-3.3-70b-versatile"
-
-# ── System prompt ──────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are ReadDoc AI — a smart, accurate document assistant.
-
-A user has uploaded one or more documents. Answer questions using ONLY the provided context.
-
-For every document question, respond in this exact format:
-
-**Answer:**
-[Clear, structured answer using bullet points where appropriate. Bold key terms and numbers.]
-
-**Source:**
-[Document name and page number(s)]
-
-Rules:
-- NEVER make up information. Only use what is in the provided context.
-- If the answer is not in the context say: "I could not find this in your uploaded documents."
-- Works with ANY document type — academic, legal, financial, technical, or general.
-
-For greetings and general chat — respond naturally and introduce yourself as ReadDoc AI.
-"""
 
 # ── Context builder ────────────────────────────────────────────────────────────
 def build_user_message(question: str, retrieved_chunks: list) -> str:

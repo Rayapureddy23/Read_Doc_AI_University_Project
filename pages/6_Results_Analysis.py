@@ -1,8 +1,6 @@
 """
-6_Results_Analysis.py — Results Comparison (0.0–1.0 scale)
+# 6_Results_Analysis.py — Results Comparison (0.0–1.0 scale)
 ============================================================
-Reads baseline and experiment scores, compares all configurations,
-auto-generates findings and research question answer.
 """
 
 import streamlit as st

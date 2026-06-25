@@ -1,19 +1,6 @@
 """
 rag.py — Retrieval-Augmented Generation Pipeline
 =================================================
-
-FIXED: Cache is now keyed by BOTH chunk_size AND the uploaded file(s).
-Previously the cache only checked chunk_size, so uploading a NEW file
-while keeping the same chunk size setting would incorrectly load the
-OLD file's cached index. Now a hash of the file names + sizes is
-included in the cache key, so a new upload always rebuilds correctly.
-
-FIXED: Embedding model is now lazy-loaded and cached via
-st.cache_resource instead of loading eagerly at import time. Eager
-loading reloaded the ~90MB model on every Streamlit rerun, which
-exceeded the 1GB RAM limit on Streamlit Cloud's free tier and crashed
-the app. Lazy + cached loading means the model loads once and is
-reused across reruns, page navigations, and even by the RAGAS judge.
 """
 
 import os
@@ -135,14 +122,6 @@ def load_html(file_path: str) -> list:
 # Cache key now includes file identity, not just chunk_size.
 # ──────────────────────────────────────────────────────────────────────────────
 def build_index(file_paths: list, chunk_size: int = 600) -> dict:
-    """
-    Build or load a FAISS index for the given files + chunk size.
-
-    The cache key is derived from the file names, file sizes, and
-    chunk size together. This guarantees that uploading a different
-    document always triggers a fresh build, even if the chunk size
-    setting is unchanged from a previous session.
-    """
     global chunk_data, index, current_cache_key
 
     cache_key   = make_cache_key(file_paths, chunk_size)
@@ -222,18 +201,7 @@ def build_index(file_paths: list, chunk_size: int = 600) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 def build_all_sizes(file_paths: list, chunk_sizes=(300, 600, 1000),
                      activate: int = 600, progress_callback=None) -> dict:
-    """
-    Build (or load from cache) an index for every chunk size in chunk_sizes.
 
-    Args:
-        file_paths:        list of uploaded file paths
-        chunk_sizes:        which chunk sizes to pre-build
-        activate:           which chunk size should be the active one when done
-        progress_callback:  optional fn(step, total, chunk_size, result) for UI progress
-
-    Returns:
-        dict mapping chunk_size -> build_index() result dict
-    """
     results = {}
     total   = len(chunk_sizes)
     for step, size in enumerate(chunk_sizes, start=1):
