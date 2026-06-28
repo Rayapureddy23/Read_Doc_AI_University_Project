@@ -249,11 +249,13 @@ for eid, cs, k in EXPERIMENTS:
     elif has_answers:
         cls, label = "cov-full", f"{eid} ✓ answers ready"
     else:
-        cls, label = "cov-none", f"{eid} — no answers"
+        cls, label = "cov-none", f"{eid} — will generate"
     pills += f'<span class="coverage-pill {cls}">{label}</span>'
 st.markdown(pills, unsafe_allow_html=True)
-st.caption("Only experiments with answers in the database can be scored. "
-           "Run Experiment Runner first if an experiment shows 'no answers'.")
+st.caption(
+    "Green = answers already saved (faster — no regeneration). "
+    "Gray = will generate answers on the fly before scoring."
+)
 
 # ── Experiment selector & run ────────────────────────────────────────────────
 st.markdown('<div class="sec">2. Run RAGAS scoring</div>', unsafe_allow_html=True)
@@ -263,42 +265,53 @@ exp_choice  = st.selectbox("Select experiment", exp_options, index=4)
 exp_idx     = exp_options.index(exp_choice)
 exp_id, chunk_size, top_k = EXPERIMENTS[exp_idx]
 
-df_answers = load_exp_answers(exp_id)
-if df_answers.empty:
-    st.warning(
-        f"No saved answers for {exp_id}. Run the Experiment Runner for "
-        f"{exp_id} first, then come back here."
+df_answers     = load_exp_answers(exp_id)
+has_saved      = not df_answers.empty
+indexed_paths  = st.session_state.get("indexed_file_paths")
+status         = rag.get_status()
+
+if has_saved:
+    st.success(
+        f"✓ Found {len(df_answers)} saved answers for {exp_id} in the database. "
+        f"RAGAS will load these directly — no answer generation needed. "
+        f"Estimated tokens: ~{len(df_answers) * 12 * 250:,} on the 8B judge model."
     )
 else:
     st.info(
-        f"Found {len(df_answers)} saved answers for {exp_id}. "
-        f"RAGAS will load these directly — no regeneration. "
-        f"Estimated judge calls: ~{len(df_answers) * 12} "
-        f"(~{len(df_answers) * 12 * 250:,} tokens on the 8B model)."
+        f"No saved answers for {exp_id} yet. "
+        f"RAGAS will generate them now using the answer model, "
+        f"then immediately score them — one step, no Experiment Runner needed. "
+        f"Estimated total tokens: ~{10 * 500:,} for answers + "
+        f"~{10 * 12 * 250:,} for judging."
     )
 
-    indexed_paths = st.session_state.get("indexed_file_paths")
-    if st.button(
-        f"Run RAGAS for {exp_id}",
-        type="primary",
-        use_container_width=True,
-        disabled=not RAGAS_AVAILABLE
-    ):
-        # Switch index to correct chunk size
-        if indexed_paths and chunk_size not in st.session_state.get("prebuilt_sizes", set()):
-            with st.spinner(f"Switching index to chunk size {chunk_size}..."):
-                rag.build_index(indexed_paths, chunk_size=chunk_size)
+if not indexed_paths and not status["loaded"]:
+    st.warning("Upload and index your document on the main ReadDoc AI page first.")
+    st.stop()
 
-        # Build RAGAS dataset from saved answers + re-retrieved context
-        from datasets import Dataset
-        from ragas import evaluate
-        from ragas.metrics import faithfulness, answer_relevancy, context_precision
+if st.button(
+    f"Run RAGAS for {exp_id}",
+    type="primary",
+    use_container_width=True,
+    disabled=not RAGAS_AVAILABLE
+):
+    from llm import ask_llama
+    from datasets import Dataset
+    from ragas import evaluate
+    from ragas.metrics import faithfulness, answer_relevancy, context_precision
 
-        questions, answers, contexts, ground_truths = [], [], [], []
+    # Switch index to correct chunk size
+    if indexed_paths and chunk_size not in st.session_state.get("prebuilt_sizes", set()):
+        with st.spinner(f"Switching index to chunk size {chunk_size}..."):
+            rag.build_index(indexed_paths, chunk_size=chunk_size)
 
+    questions, answers, contexts, ground_truths = [], [], [], []
+
+    if has_saved:
+        # ── Path A: read from database (fast, zero generation tokens) ──────
         prog = st.progress(0, text="Loading saved answers and re-retrieving context...")
         for i, q in enumerate(QUESTIONS):
-            prog.progress((i+1)/10, text=f"Preparing Q{q['id']}/10...")
+            prog.progress((i+1)/10, text=f"Loading Q{q['id']}/10...")
             row = df_answers[df_answers["question_id"] == q["id"]]
             if row.empty:
                 continue
@@ -308,77 +321,123 @@ else:
             questions.append(q["text"])
             answers.append(answer)
             contexts.append(ctx)
-            ground_truths.append("")  # not required by these three metrics
+            ground_truths.append("")
         prog.empty()
+        st.success(f"Loaded {len(questions)} answers from database.")
+    else:
+        # ── Path B: generate answers now (direct, no Experiment Runner) ────
+        os.makedirs(os.path.dirname(DB), exist_ok=True)
+        conn_init = sqlite3.connect(DB)
+        conn_init.execute("""
+            CREATE TABLE IF NOT EXISTS experiment_scores (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                experiment TEXT, question_id INTEGER, question TEXT,
+                answer TEXT, sources TEXT,
+                accuracy REAL, relevance REAL, faithfulness REAL,
+                UNIQUE(experiment,question_id))""")
+        conn_init.commit()
+        conn_init.close()
 
-        if not questions:
-            st.error("No valid answers found. Ensure questions are saved for this experiment.")
-            st.stop()
+        prog = st.progress(0, text="Generating answers...")
+        for i, q in enumerate(QUESTIONS):
+            prog.progress((i+1)/10, text=f"Generating Q{q['id']}/10...")
+            chunks = rag.search(q["text"], top_k=top_k)
+            answer = ask_llama(q["text"], chunks, [])
+            src    = " | ".join({f"p.{c['page_number']}" for c in chunks})
+            ctx    = [c["text"] for c in chunks] if chunks else ["No context retrieved."]
 
-        n = len(questions)
-        st.info(
-            f"Prepared {n} question-answer-context triples. "
-            f"Running RAGAS judge — this takes a few minutes as each question "
-            f"triggers multiple small judge calls..."
+            # Save to experiment_scores so Experiment Runner can also see them
+            conn_s = sqlite3.connect(DB)
+            conn_s.execute("""
+                INSERT INTO experiment_scores
+                    (experiment,question_id,question,answer,sources,
+                     accuracy,relevance,faithfulness)
+                VALUES (?,?,?,?,?,0.5,0.5,0.5)
+                ON CONFLICT(experiment,question_id) DO UPDATE SET
+                    answer=excluded.answer, sources=excluded.sources
+            """, (exp_id, q["id"], q["text"], answer, src))
+            conn_s.commit()
+            conn_s.close()
+
+            questions.append(q["text"])
+            answers.append(answer)
+            contexts.append(ctx)
+            ground_truths.append("")
+        prog.empty()
+        st.success(
+            f"Generated {len(questions)} answers and saved them. "
+            f"You can now also open Experiment Runner to review and "
+            f"manually score them if needed."
         )
 
-        try:
-            from ragas import RunConfig
-            dataset = Dataset.from_dict({
-                "question":     questions,
-                "answer":       answers,
-                "contexts":     contexts,
-                "ground_truth": ground_truths,
-            })
-            run_cfg = RunConfig(max_workers=1, timeout=180)
-            result  = evaluate(
-                dataset,
-                metrics=[faithfulness, answer_relevancy, context_precision],
-                llm=JUDGE_LLM,
-                embeddings=JUDGE_EMBS,
-                run_config=run_cfg,
+    if not questions:
+        st.error("No answers available. Check your document is indexed.")
+        st.stop()
+
+    n = len(questions)
+    st.info(
+        f"Running RAGAS judge on {n} question-answer-context triples. "
+        f"This takes a few minutes — each question triggers multiple small "
+        f"judge calls on the 8B model..."
+    )
+
+    try:
+        from ragas import RunConfig
+        dataset = Dataset.from_dict({
+            "question":     questions,
+            "answer":       answers,
+            "contexts":     contexts,
+            "ground_truth": ground_truths,
+        })
+        run_cfg = RunConfig(max_workers=1, timeout=180)
+        result  = evaluate(
+            dataset,
+            metrics=[faithfulness, answer_relevancy, context_precision],
+            llm=JUDGE_LLM,
+            embeddings=JUDGE_EMBS,
+            run_config=run_cfg,
+        )
+        df_result = result.to_pandas()
+
+        raw_faith = float(df_result["faithfulness"].mean())
+        raw_relev = float(df_result["answer_relevancy"].mean())
+        raw_prec  = float(df_result["context_precision"].mean())
+
+        if all(math.isnan(v) for v in [raw_faith, raw_relev, raw_prec]):
+            st.error(
+                "All metrics returned NaN — every judge call failed. "
+                "This usually means the Groq key hit a rate limit during "
+                "the burst of judge calls. Wait a minute and try again."
             )
-            df_result = result.to_pandas()
+            st.stop()
 
-            raw_faith = float(df_result["faithfulness"].mean())
-            raw_relev = float(df_result["answer_relevancy"].mean())
-            raw_prec  = float(df_result["context_precision"].mean())
+        faith   = round(raw_faith if not math.isnan(raw_faith) else 0.0, 4)
+        relev   = round(raw_relev if not math.isnan(raw_relev) else 0.0, 4)
+        prec    = round(raw_prec  if not math.isnan(raw_prec)  else 0.0, 4)
+        overall = round((faith + relev + prec) / 3, 4)
 
-            if all(math.isnan(v) for v in [raw_faith, raw_relev, raw_prec]):
-                st.error(
-                    "All metrics returned NaN — every judge call failed. "
-                    "This usually means the Groq key hit a rate limit during "
-                    "the burst of judge calls. Wait a minute and try again."
-                )
-                st.stop()
+        save_ragas_result(exp_id, chunk_size, top_k, faith, relev, prec, overall, n)
+        st.session_state["ragas_latest"] = {
+            "experiment": exp_id, "chunk_size": chunk_size, "top_k": top_k,
+            "faithfulness": faith, "answer_relevancy": relev,
+            "context_precision": prec, "overall": overall, "n": n,
+        }
+        st.rerun()
 
-            faith   = round(raw_faith if not math.isnan(raw_faith) else 0.0, 4)
-            relev   = round(raw_relev if not math.isnan(raw_relev) else 0.0, 4)
-            prec    = round(raw_prec  if not math.isnan(raw_prec)  else 0.0, 4)
-            overall = round((faith + relev + prec) / 3, 4)
-
-            save_ragas_result(exp_id, chunk_size, top_k, faith, relev, prec, overall, n)
-            st.session_state["ragas_latest"] = {
-                "experiment": exp_id, "chunk_size": chunk_size, "top_k": top_k,
-                "faithfulness": faith, "answer_relevancy": relev,
-                "context_precision": prec, "overall": overall, "n": n,
-            }
-            st.rerun()
-
-        except Exception as e:
-            err = str(e)
-            st.error(f"RAGAS scoring failed: {err}")
-            if "rate_limit" in err.lower() or "429" in err or "quota" in err.lower():
-                st.info(
-                    "This is Groq's rate limit on the 8B judge model. "
-                    "The 2-second delay between calls usually prevents this. "
-                    "Wait 1 minute and try again."
-                )
-            elif "openai" in err.lower() or "api_key" in err.lower():
-                st.info(
-                    "RAGAS tried to fall back to OpenAI — the judge setup "
-                    "failed. Check GROQ_API_KEY is set correctly."
-                )
+    except Exception as e:
+        err = str(e)
+        st.error(f"RAGAS scoring failed: {err}")
+        if "rate_limit" in err.lower() or "429" in err or "quota" in err.lower():
+            st.info(
+                "This is Groq's rate limit on the 8B judge model. "
+                "The 2-second delay between calls usually prevents this. "
+                "Wait 1 minute and try again."
+            )
+        elif "openai" in err.lower() or "api_key" in err.lower():
+            st.info(
+                "RAGAS tried to fall back to OpenAI — the judge setup "
+                "failed. Check GROQ_API_KEY is set correctly."
+            )
 
 # ── Latest result panel ────────────────────────────────────────────────────────
 if "ragas_latest" in st.session_state:
