@@ -1,6 +1,7 @@
 """
 9_Auto_Evaluation.py — Fully Automated Evaluation
 ===================================================
+ReadDoc AI | MSc Data Science and Analytics
 
 One click runs the complete evaluation pipeline:
   1. Generate all 10 answers using the LLM
@@ -153,6 +154,10 @@ try:
             return rag.get_embedding_model().encode(texts).tolist()
         def embed_query(self, text):
             return rag.get_embedding_model().encode([text])[0].tolist()
+        async def aembed_documents(self, texts):
+            return self.embed_documents(texts)
+        async def aembed_query(self, text):
+            return self.embed_query(text)
 
     JUDGE_LLM  = LangchainLLMWrapper(_JudgeLLM())
     JUDGE_EMBS = LangchainEmbeddingsWrapper(_LocalEmb())
