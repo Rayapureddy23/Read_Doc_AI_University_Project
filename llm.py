@@ -1,4 +1,4 @@
-﻿"""
+"""
 llm.py — Language Model Integration
 =====================================
 
