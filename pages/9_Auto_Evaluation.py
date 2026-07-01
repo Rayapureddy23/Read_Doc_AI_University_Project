@@ -2,6 +2,19 @@
 9_Auto_Evaluation.py — Fully Automated Evaluation
 ===================================================
 
+One click runs the complete evaluation pipeline:
+  1. Generate all 10 answers using the LLM
+  2. Score all 4 RAGAS metrics automatically:
+       - Faithfulness        (claim-level grounding)
+       - Answer Relevancy    (does it address the question?)
+       - Context Precision   (are retrieved chunks relevant?)
+       - Answer Correctness  (how correct vs reference answer?)
+  3. Save everything to database
+  4. Display professional charts immediately
+
+No manual input. Zero human judgement required.
+"""
+
 import streamlit as st
 import sys, os, sqlite3, time, math
 import pandas as pd
@@ -24,7 +37,7 @@ st.markdown("""
 html,body,[class*="css"]{font-family:'DM Sans',sans-serif!important}
 .stApp{background:#F0F4FF}
 .main .block-container{background:#fff;border-radius:16px;margin:1rem;
-    padding:2.5rem 3rem!important;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+    padding:2.5rem 3rem!important;box-shadow:0 1px 3px rgba(0,0,0,0.06)}
 h1{font-size:26px!important;font-weight:700!important;color:#111827!important}
 .sec{font-size:17px;font-weight:600;color:#111827;margin:2rem 0 .8rem;
     padding-bottom:8px;border-bottom:2px solid #EEF2FF}
