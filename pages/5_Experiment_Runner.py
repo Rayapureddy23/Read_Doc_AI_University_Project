@@ -14,7 +14,7 @@ st.markdown("""
 html,body,[class*="css"]{font-family:'DM Sans',sans-serif!important}
 .stApp{background:#F0F4FF}
 .main .block-container{background:#fff;border-radius:16px;margin:1rem;
-    padding:2.5rem 3rem!important;box-shadow:0 1px 3px rgba(0,0,0,.06);max-width:900px}
+    padding:2.5rem 3rem!important;box-shadow:0 1px 3px rgba(0,0,0,0.06);max-width:900px}
 h1{font-size:26px!important;font-weight:700!important;color:#111827!important;margin-bottom:4px!important}
 .subtitle{font-size:14px;color:#6B7280;margin-bottom:1.5rem}
 .rubric{background:#EEF2FF;border-left:4px solid #1a56db;border-radius:0 8px 8px 0;

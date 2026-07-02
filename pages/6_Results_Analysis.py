@@ -116,12 +116,15 @@ if not has_any:
     """, unsafe_allow_html=True)
     st.stop()
 
-# ── Build summary from RAGAS results (primary source) ──────────────────────────
-rows = []
+# ── Build merged results from ALL sources ─────────────────────────────────────
+# Priority: RAGAS > Auto Eval > Manual (for same experiment)
+# All three are merged so every scored experiment appears regardless
+# of which page was used to score it.
+rows = {}   # keyed by experiment ID to handle duplicates
 
 # Baseline row
 if has_base:
-    rows.append({
+    rows["Baseline"] = {
         "Config":            "Baseline",
         "Chunk":             0,
         "k":                 0,
@@ -130,48 +133,11 @@ if has_base:
         "Context Precision": 0.0,
         "Overall":           round((0.0 + float(baseline_df["relevance"].mean()) + 0.0) / 3, 4),
         "Source":            "Manual",
-    })
+    }
 
-# RAGAS results
-if has_ragas:
-    for _, r in ragas_df.iterrows():
-        exp = r["experiment"]
-        cs, k = EXP_CONFIG.get(exp, (0, 0))
-        rows.append({
-            "Config":            exp,
-            "Chunk":             cs,
-            "k":                 k,
-            "Faithfulness":      round(float(r["faithfulness"]), 4),
-            "Answer Relevancy":  round(float(r["answer_relevancy"]), 4),
-            "Context Precision": round(float(r["context_precision"]), 4),
-            "Overall":           round(float(r["overall"]), 4),
-            "Source":            "RAGAS",
-        })
-
-# Auto eval results (if no RAGAS, use these)
-if has_auto and not has_ragas:
-    for _, r in auto_df.iterrows():
-        exp = r["experiment"]
-        cs, k = EXP_CONFIG.get(exp, (0, 0))
-        rows.append({
-            "Config":            exp,
-            "Chunk":             cs,
-            "k":                 k,
-            "Faithfulness":      round(float(r["faithfulness"]), 4),
-            "Answer Relevancy":  round(float(r["answer_relevancy"]), 4),
-            "Context Precision": round(float(r["context_precision"]), 4),
-            "Overall":           round(float(r["overall"]), 4),
-            "Source":            "Auto",
-        })
-
-# Manual-only results for experiments not in RAGAS
+# Manual scores — lowest priority, added first
 if has_manual:
-    ragas_exps = set(ragas_df["experiment"].tolist()) if has_ragas else set()
-    auto_exps  = set(auto_df["experiment"].tolist()) if has_auto else set()
-    covered    = ragas_exps | auto_exps
     for exp in ALL_EXPS:
-        if exp in covered:
-            continue
         df_e = manual_df[manual_df["experiment"] == exp]
         if df_e.empty:
             continue
@@ -179,7 +145,7 @@ if has_manual:
         avg_a = round(float(df_e["accuracy"].mean()), 4)
         avg_r = round(float(df_e["relevance"].mean()), 4)
         avg_f = round(float(df_e["faithfulness"].mean()), 4)
-        rows.append({
+        rows[exp] = {
             "Config":            exp,
             "Chunk":             cs,
             "k":                 k,
@@ -188,9 +154,49 @@ if has_manual:
             "Context Precision": avg_a,
             "Overall":           round((avg_a + avg_r + avg_f) / 3, 4),
             "Source":            "Manual",
-        })
+        }
 
-if not rows:
+# Auto Evaluation results — medium priority, overwrite manual
+if has_auto:
+    for _, r in auto_df.iterrows():
+        exp = r["experiment"]
+        cs, k = EXP_CONFIG.get(exp, (0, 0))
+        rows[exp] = {
+            "Config":            exp,
+            "Chunk":             cs,
+            "k":                 k,
+            "Faithfulness":      round(float(r["faithfulness"]), 4),
+            "Answer Relevancy":  round(float(r["answer_relevancy"]), 4),
+            "Context Precision": round(float(r["context_precision"]), 4),
+            "Overall":           round(float(r["overall"]), 4),
+            "Source":            "Auto Eval",
+        }
+
+# RAGAS results — highest priority, overwrite auto/manual for same experiment
+if has_ragas:
+    for _, r in ragas_df.iterrows():
+        exp = r["experiment"]
+        cs, k = EXP_CONFIG.get(exp, (0, 0))
+        rows[exp] = {
+            "Config":            exp,
+            "Chunk":             cs,
+            "k":                 k,
+            "Faithfulness":      round(float(r["faithfulness"]), 4),
+            "Answer Relevancy":  round(float(r["answer_relevancy"]), 4),
+            "Context Precision": round(float(r["context_precision"]), 4),
+            "Overall":           round(float(r["overall"]), 4),
+            "Source":            "RAGAS",
+        }
+
+# Convert to list sorted by experiment order
+row_list = []
+if "Baseline" in rows:
+    row_list.append(rows["Baseline"])
+for exp in ALL_EXPS:
+    if exp in rows:
+        row_list.append(rows[exp])
+
+if not row_list:
     st.markdown("""
     <div class="empty-box">
         <b style="color:#374151;font-size:15px">No scored experiments found</b><br><br>
@@ -199,7 +205,7 @@ if not rows:
     """, unsafe_allow_html=True)
     st.stop()
 
-df = pd.DataFrame(rows)
+df = pd.DataFrame(row_list)
 
 # Safety check — ensure Config column exists
 if "Config" not in df.columns:
@@ -353,7 +359,7 @@ if not rag_df.empty:
     """, unsafe_allow_html=True)
 
     faith_gain = round(float(best["Faithfulness"]) - 0.0, 4)
-    overall_gain = round(float(best["Overall"]) - (rows[0]["Overall"] if rows else 0), 4)
+    overall_gain = round(float(best["Overall"]) - (row_list[0]["Overall"] if row_list else 0), 4)
     st.markdown(f"""
     <div class="finding">
         <b>RAG vs Baseline:</b> Faithfulness improved from <b>0.0000</b>
